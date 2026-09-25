@@ -48,10 +48,10 @@ static const char *TAG = "modem_watchdog";
 #define RELAY_MODEM_OFF_LEVEL      0
 
 #define DEFAULT_CHECK_INTERVAL_S      60U
-#define DEFAULT_FAILURES_BEFORE_REBOOT 5U
+#define DEFAULT_app_cfg.failures_before_reboot 5U
 #define DEFAULT_MODEM_OFF_S            20U
 #define DEFAULT_MODEM_BOOT_S           300U
-#define DEFAULT_MAX_AUTO_REBOOTS       3U
+#define DEFAULT_app_cfg.max_auto_reboots       3U
 #define DEFAULT_REBOOT_WINDOW_S        7200U
 #define TCP_PROBE_TIMEOUT_MS           2500
 
@@ -124,10 +124,10 @@ static void app_config_defaults(app_settings_t *cfg) {
 #endif
 
     cfg->check_interval_s = DEFAULT_CHECK_INTERVAL_S;
-    cfg->failures_before_reboot = DEFAULT_FAILURES_BEFORE_REBOOT;
+    cfg->failures_before_reboot = DEFAULT_app_cfg.failures_before_reboot;
     cfg->modem_off_s = DEFAULT_MODEM_OFF_S;
     cfg->modem_boot_s = DEFAULT_MODEM_BOOT_S;
-    cfg->max_auto_reboots = DEFAULT_MAX_AUTO_REBOOTS;
+    cfg->max_auto_reboots = DEFAULT_app_cfg.max_auto_reboots;
     cfg->reboot_window_s = DEFAULT_REBOOT_WINDOW_S;
 }
 
@@ -324,7 +324,7 @@ static const char *watchdog_state_name(watchdog_state_t state) {
 }
 
 static void refresh_reboot_window(uint64_t now) {
-    if (now - reboot_window_started_ms >= REBOOT_WINDOW_MS) {
+    if (now - reboot_window_started_ms >= cfg_reboot_window_ms()) {
         reboot_window_started_ms = now;
         automatic_reboots = 0;
         ESP_LOGI(TAG, "Automatic reboot window reset");
@@ -340,9 +340,9 @@ static bool start_modem_reboot(bool manual) {
 
     if (!manual) {
         refresh_reboot_window(now);
-        if (automatic_reboots >= MAX_AUTO_REBOOTS) {
+        if (automatic_reboots >= app_cfg.max_auto_reboots) {
             ESP_LOGE(TAG, "Automatic reboot limit reached (%d/%d)",
-                     automatic_reboots, MAX_AUTO_REBOOTS);
+                     automatic_reboots, app_cfg.max_auto_reboots);
             return false;
         }
         automatic_reboots++;
@@ -358,16 +358,16 @@ static bool start_modem_reboot(bool manual) {
 }
 
 static void update_reboot_state(uint64_t now) {
-    if (wd_state == WD_POWER_CUT && now - state_started_ms >= MODEM_OFF_MS) {
+    if (wd_state == WD_POWER_CUT && now - state_started_ms >= cfg_modem_off_ms()) {
         modem_on();
         wd_state = WD_WAITING_FOR_MODEM;
         state_started_ms = now;
         ESP_LOGW(TAG, "Modem powered back on; waiting %llu seconds",
-                 (unsigned long long)(MODEM_BOOT_MS / 1000ULL));
+                 (unsigned long long)(cfg_modem_boot_ms() / 1000ULL));
         return;
     }
 
-    if (wd_state == WD_WAITING_FOR_MODEM && now - state_started_ms >= MODEM_BOOT_MS) {
+    if (wd_state == WD_WAITING_FOR_MODEM && now - state_started_ms >= cfg_modem_boot_ms()) {
         wd_state = WD_NORMAL;
         consecutive_failures = 0;
         last_internet_check_ms = now;
@@ -390,7 +390,7 @@ static void watchdog_task(void *arg) {
 
         update_reboot_state(now);
 
-        if (wd_state == WD_NORMAL && now - last_internet_check_ms >= CHECK_INTERVAL_MS) {
+        if (wd_state == WD_NORMAL && now - last_internet_check_ms >= cfg_check_interval_ms()) {
             last_internet_check_ms = now;
             refresh_reboot_window(now);
 
@@ -401,9 +401,9 @@ static void watchdog_task(void *arg) {
             } else {
                 consecutive_failures++;
                 ESP_LOGW(TAG, "Internet failure %d/%d",
-                         consecutive_failures, FAILURES_BEFORE_REBOOT);
+                         consecutive_failures, app_cfg.failures_before_reboot);
 
-                if (consecutive_failures >= FAILURES_BEFORE_REBOOT) {
+                if (consecutive_failures >= app_cfg.failures_before_reboot) {
                     start_modem_reboot(false);
                 }
             }
@@ -519,8 +519,8 @@ static esp_err_t root_handler(httpd_req_t *req) {
         wifi_ok ? "conectado" : "desconectado",
         tailscale_ok ? "conectado" : "desconectado",
         vpn_ip,
-        consecutive_failures, FAILURES_BEFORE_REBOOT,
-        automatic_reboots, MAX_AUTO_REBOOTS,
+        consecutive_failures, app_cfg.failures_before_reboot,
+        automatic_reboots, app_cfg.max_auto_reboots,
         watchdog_state_name(wd_state));
 
     if (n < 0 || n >= (int)sizeof(status)) {
