@@ -794,10 +794,6 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
     if (ack_len < 0) return -1;
     pos += ack_len;
 
-    /* Connection-level WINDOW_UPDATE (stream 0) to expand the connection window
-     * beyond the 65535 default. SETTINGS INITIAL_WINDOW_SIZE only sets per-stream
-     * window; the connection-level window starts at 65535 and must be explicitly
-     * expanded with WINDOW_UPDATE on stream 0. */
     /* The HTTP/2 connection window always starts at 65535 and cannot be
      * reduced with WINDOW_UPDATE. When RAM pressure makes our receive window
      * smaller than 64KB, only advertise the smaller per-stream
@@ -809,7 +805,6 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
         int wu_len = ml_h2_build_window_update(h2_init + pos, sizeof(h2_init) - pos,
                                                 0, conn_window_delta);
         if (wu_len > 0) pos += wu_len;
-    }
     }
 
     /* Encrypt and send as one Noise frame */
