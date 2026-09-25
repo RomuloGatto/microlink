@@ -1043,6 +1043,77 @@ static void start_http_server(void) {
  * WiFi
  * ========================================================================== */
 
+static void build_wifi_config(wifi_config_t *cfg,
+                              const char *ssid, const char *password) {
+    memset(cfg, 0, sizeof(*cfg));
+    copy_str((char *)cfg->sta.ssid, sizeof(cfg->sta.ssid), ssid);
+    copy_str((char *)cfg->sta.password, sizeof(cfg->sta.password), password);
+    cfg->sta.threshold.authmode =
+        (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+}
+
+static void wifi_pending_validation_task(void *arg) {
+    (void)arg;
+    if (!app_cfg.wifi_pending) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Validating pending WiFi network '%s' for 30 seconds",
+             app_cfg.wifi_ssid);
+
+    EventBits_t bits = xEventGroupWaitBits(
+        wifi_event_group, WIFI_CONNECTED_BIT,
+        pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        app_cfg.wifi_pending = 0;
+        app_cfg.prev_wifi_ssid[0] = '\0';
+        app_cfg.prev_wifi_pass[0] = '\0';
+        esp_err_t err = app_config_save();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Pending WiFi committed: %s", app_cfg.wifi_ssid);
+        } else {
+            ESP_LOGE(TAG, "Failed to commit validated WiFi: %s",
+                     esp_err_to_name(err));
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!app_cfg.prev_wifi_ssid[0]) {
+        ESP_LOGE(TAG, "Pending WiFi failed and no rollback network is available");
+        app_cfg.wifi_pending = 0;
+        app_config_save();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGE(TAG, "Pending WiFi failed; rolling back to '%s'",
+             app_cfg.prev_wifi_ssid);
+
+    char rollback_ssid[33];
+    char rollback_pass[65];
+    copy_str(rollback_ssid, sizeof(rollback_ssid), app_cfg.prev_wifi_ssid);
+    copy_str(rollback_pass, sizeof(rollback_pass), app_cfg.prev_wifi_pass);
+
+    copy_str(app_cfg.wifi_ssid, sizeof(app_cfg.wifi_ssid), rollback_ssid);
+    copy_str(app_cfg.wifi_pass, sizeof(app_cfg.wifi_pass), rollback_pass);
+    app_cfg.prev_wifi_ssid[0] = '\0';
+    app_cfg.prev_wifi_pass[0] = '\0';
+    app_cfg.wifi_pending = 0;
+    app_config_save();
+
+    wifi_config_t wifi_config;
+    build_wifi_config(&wifi_config, rollback_ssid, rollback_pass);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(250));
+    esp_wifi_connect();
+
+    vTaskDelete(NULL);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t event_id, void *event_data) {
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -1091,22 +1162,25 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    strncpy((char *)wifi_config.sta.ssid,
-            CONFIG_ML_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password,
-            CONFIG_ML_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    wifi_config_t wifi_config;
+    build_wifi_config(&wifi_config, app_cfg.wifi_ssid, app_cfg.wifi_pass);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    ESP_LOGI(TAG, "WiFi started; SSID=%s", CONFIG_ML_WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi started; SSID=%s%s",
+             app_cfg.wifi_ssid,
+             app_cfg.wifi_pending ? " (pending validation)" : "");
+
+    if (app_cfg.wifi_pending) {
+        BaseType_t ok = xTaskCreate(
+            wifi_pending_validation_task, "wifi_validate", 3072, NULL, 7, NULL);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Could not start WiFi validation task");
+        }
+    }
 }
 
 /* ============================================================================
