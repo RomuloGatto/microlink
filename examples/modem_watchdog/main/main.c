@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
