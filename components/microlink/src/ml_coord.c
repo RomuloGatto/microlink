@@ -795,6 +795,10 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
+/* Advertise the configured subnet route in Hostinfo.RoutableIPs.
+ * Defined below with the MapRequest JSON helpers. */
+static void add_routable_ips_to_hostinfo(microlink_t *ml, cJSON *hostinfo);
+
 /* ============================================================================
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
  * ========================================================================== */
