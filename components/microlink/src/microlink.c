@@ -434,6 +434,15 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
 
+    if (config->ctrl_host && config->ctrl_host[0]) {
+        strncpy(ml->ctrl_host, config->ctrl_host, sizeof(ml->ctrl_host) - 1);
+        ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
+    }
+    if (config->ctrl_noise_pubkey) {
+        memcpy(ml->ctrl_noise_pubkey, config->ctrl_noise_pubkey, 32);
+        ml->ctrl_noise_pubkey_set = true;
+    }
+
 #ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
     {
         const char *route = ml->config.advertise_route;
