@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <unistd.h>
@@ -1187,6 +1188,26 @@ static void wifi_init(void) {
  * MicroLink
  * ========================================================================== */
 
+static int hex_nibble(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static bool decode_noise_key(const char *hex, uint8_t out[32]) {
+    if (!hex || strlen(hex) != 64) return false;
+    for (size_t i = 0; i < 32; i++) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static uint8_t runtime_noise_pubkey[32];
+
 static void on_microlink_state(microlink_t *handle, microlink_state_t state,
                                void *user_data) {
     ESP_LOGI(TAG, "MicroLink state=%d", (int)state);
@@ -1196,8 +1217,8 @@ static void on_microlink_state(microlink_t *handle, microlink_state_t state,
         microlink_ip_to_str(microlink_get_vpn_ip(handle), ip);
         ESP_LOGI(TAG, "Tailscale connected: %s", ip);
 #ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
-        if (CONFIG_ML_SUBNET_ROUTE[0] != '\0') {
-            ESP_LOGI(TAG, "Advertising subnet route: %s", CONFIG_ML_SUBNET_ROUTE);
+        if (app_cfg.subnet_enabled && app_cfg.subnet_route[0] != '\0') {
+            ESP_LOGI(TAG, "Advertising subnet route: %s", app_cfg.subnet_route);
         }
 #endif
     }
@@ -1209,16 +1230,36 @@ static void microlink_task(void *arg) {
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
+    const uint8_t *noise_key = NULL;
+    if (app_cfg.noise_pubkey_hex[0]) {
+        if (decode_noise_key(app_cfg.noise_pubkey_hex, runtime_noise_pubkey)) {
+            noise_key = runtime_noise_pubkey;
+        } else {
+            ESP_LOGE(TAG, "Stored Noise public key is invalid; refusing to start MicroLink");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    uint32_t priority_peer = app_cfg.priority_peer_ip[0]
+        ? microlink_parse_ip(app_cfg.priority_peer_ip) : 0;
+
     microlink_config_t config = {
-        .auth_key = CONFIG_ML_TAILSCALE_AUTH_KEY,
-        .device_name = CONFIG_ML_DEVICE_NAME,
+        .auth_key = app_cfg.auth_key,
+        .device_name = app_cfg.device_name[0] ? app_cfg.device_name : NULL,
         .enable_derp = true,
         .enable_stun = true,
         .enable_disco = true,
         .max_peers = CONFIG_ML_MAX_PEERS,
         .wifi_tx_power_dbm = 0,
+        .priority_peer_ip = priority_peer,
+        .ctrl_host = app_cfg.ctrl_host[0] ? app_cfg.ctrl_host : NULL,
+        .ctrl_noise_pubkey = noise_key,
+        .ctrl_tls_override = true,
+        .ctrl_tls = app_cfg.ctrl_tls != 0,
 #ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
-        .advertise_route = CONFIG_ML_SUBNET_ROUTE,
+        .advertise_route = app_cfg.subnet_enabled ? app_cfg.subnet_route : "",
+        .advertise_route_override = true,
 #endif
     };
 
