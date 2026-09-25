@@ -147,12 +147,33 @@ static esp_err_t app_config_save(void) {
     return err;
 }
 
+static void persist_defaults_if_provisioned(void) {
+    /* A fresh/migrated device may have no runtime blob yet but still have
+     * provisioning values in sdkconfig. Seed those values into NVS once so
+     * subsequent OTA updates no longer depend on build-time credentials. */
+    if (!app_cfg.wifi_ssid[0] && !app_cfg.auth_key[0]) {
+        return;
+    }
+
+    esp_err_t err = app_config_save();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Seeded runtime settings from sdkconfig defaults");
+    } else {
+        ESP_LOGW(TAG, "Could not seed runtime settings: %s",
+                 esp_err_to_name(err));
+    }
+}
+
 static void app_config_load(void) {
     app_config_defaults(&app_cfg);
 
     nvs_handle_t nvs;
-    if (nvs_open(APP_CONFIG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        ESP_LOGI(TAG, "No runtime settings yet; using sdkconfig defaults");
+    esp_err_t open_err = nvs_open(APP_CONFIG_NAMESPACE, NVS_READONLY, &nvs);
+    if (open_err != ESP_OK) {
+        ESP_LOGI(TAG,
+                 "No runtime settings yet (%s); using sdkconfig defaults",
+                 esp_err_to_name(open_err));
+        persist_defaults_if_provisioned();
         return;
     }
 
@@ -166,7 +187,10 @@ static void app_config_load(void) {
         app_cfg = stored;
         ESP_LOGI(TAG, "Runtime settings loaded from NVS");
     } else {
-        ESP_LOGI(TAG, "No compatible runtime settings; using sdkconfig defaults");
+        ESP_LOGI(TAG,
+                 "No compatible runtime settings (%s, len=%u); using sdkconfig defaults",
+                 esp_err_to_name(err), (unsigned)len);
+        persist_defaults_if_provisioned();
     }
 }
 
@@ -1591,6 +1615,8 @@ void app_main(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS init returned %s; erasing default NVS partition",
+                 esp_err_to_name(ret));
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
