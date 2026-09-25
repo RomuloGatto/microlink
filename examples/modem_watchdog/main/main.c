@@ -301,45 +301,93 @@ static esp_err_t root_handler(httpd_req_t *req) {
     const bool tailscale_ok = ml && microlink_is_connected(ml);
     const bool healthy = wd_state == WD_NORMAL && wifi_ok;
 
-    static char html[2560];
-    int n = snprintf(
-        html, sizeof(html),
+    /* Keep the large, invariant UI strings in flash instead of reserving
+     * several KB of scarce internal RAM on classic ESP32. */
+    static const char head[] =
         "<!doctype html><html><head>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<meta http-equiv='refresh' content='10'>"
         "<title>Modem Watchdog</title>"
         "<style>"
         "*{box-sizing:border-box}body{margin:0;padding:24px;background:#0b0f14;"
         "color:#eef2f7;font:15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}"
         ".c{max-width:560px;margin:auto}.h{display:flex;align-items:center;"
         "justify-content:space-between;margin-bottom:18px}.t{font-size:22px;font-weight:700}"
-        ".b{padding:7px 10px;border-radius:999px;background:%s;color:white;font-size:12px;font-weight:700}"
-        ".p{background:#121821;border:1px solid #202a36;border-radius:18px;padding:18px;"
-        "box-shadow:0 14px 40px #0006}.g{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
-        ".s{background:#0e141c;border:1px solid #1e2936;border-radius:14px;padding:14px}"
-        ".l{color:#8190a3;font-size:12px;margin-bottom:5px}.v{font-size:17px;font-weight:650}"
-        ".dot{display:inline-block;width:8px;height:8px;border-radius:50%%;"
-        "background:%s;margin-right:7px}.a{display:block;margin-top:14px;color:#9fb0c5;"
-        "text-decoration:none;font-size:13px}.btn{width:100%%;margin-top:18px;padding:14px;"
-        "border:0;border-radius:12px;background:#e5484d;color:white;font-size:15px;"
-        "font-weight:700;cursor:pointer}.n{text-align:center;color:#68788b;font-size:12px;margin-top:9px}"
-        "</style></head><body><div class='c'>"
-        "<div class='h'><div class='t'>Modem Watchdog</div><div class='b'>%s</div></div>"
+        ".b{padding:7px 10px;border-radius:999px;color:#fff;font-size:12px;font-weight:700}"
+        ".ok{background:#2f9e44}.bad{background:#d9485f}.p{background:#121821;"
+        "border:1px solid #202a36;border-radius:18px;padding:18px;box-shadow:0 14px 40px #0006}"
+        ".g{display:grid;grid-template-columns:1fr 1fr;gap:10px}.s{background:#0e141c;"
+        "border:1px solid #1e2936;border-radius:14px;padding:14px}.l{color:#8190a3;"
+        "font-size:12px;margin-bottom:5px}.v{font-size:17px;font-weight:650}"
+        ".dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px}"
+        ".a{display:block;margin-top:14px;color:#9fb0c5;text-decoration:none;font-size:13px}"
+        ".btn{width:100%;margin-top:18px;padding:14px;border:0;border-radius:12px;"
+        "background:#e5484d;color:#fff;font-size:15px;font-weight:700;cursor:pointer}"
+        ".n{text-align:center;color:#68788b;font-size:12px;margin-top:9px}"
+        ".ov{position:fixed;inset:0;background:#000a;display:none;align-items:center;"
+        "justify-content:center;padding:20px;backdrop-filter:blur(5px);z-index:10}"
+        ".ov.show{display:flex}.m{width:min(420px,100%);background:#151c25;border:1px solid #293442;"
+        "border-radius:20px;padding:22px;box-shadow:0 24px 80px #000b}.m h3{margin:0 0 8px;font-size:20px}"
+        ".m p{margin:0;color:#94a3b5;line-height:1.45}.actions{display:flex;gap:10px;margin-top:22px}"
+        ".actions button{flex:1;padding:12px;border:0;border-radius:11px;font-weight:700;cursor:pointer}"
+        ".cancel{background:#26313e;color:#e6edf5}.danger{background:#e5484d;color:#fff}"
+        ".count{font-size:46px;font-weight:800;text-align:center;margin:20px 0 4px;"
+        "font-variant-numeric:tabular-nums}.sub{text-align:center;color:#8190a3;font-size:12px}"
+        "</style></head><body><div class='c'>";
+
+    static const char tail[] =
+        "</div>"
+        "<div id='modal' class='ov'><div class='m'>"
+        "<h3 id='mt'>Reiniciar modem?</h3>"
+        "<p id='md'>O ESP vai cortar a energia do modem por 20 segundos e ligar novamente.</p>"
+        "<div id='count' class='count' style='display:none'></div>"
+        "<div id='sub' class='sub' style='display:none'>religando a fonte em...</div>"
+        "<div id='actions' class='actions'>"
+        "<button class='cancel' onclick='closeModal()'>Cancelar</button>"
+        "<button class='danger' onclick='doReboot()'>Reiniciar</button>"
+        "</div></div></div>"
+        "<script>"
+        "const m=document.getElementById('modal'),a=document.getElementById('actions'),"
+        "t=document.getElementById('mt'),d=document.getElementById('md'),"
+        "c=document.getElementById('count'),s=document.getElementById('sub');"
+        "let busy=false;"
+        "function openModal(){m.classList.add('show')}"
+        "function closeModal(){if(!busy)m.classList.remove('show')}"
+        "m.addEventListener('click',e=>{if(e.target===m)closeModal()});"
+        "async function doReboot(){"
+        "busy=true;a.style.display='none';t.textContent='Reiniciando modem';"
+        "d.textContent='Comando enviado ao ESP. A fonte do modem ficara desligada por 20 segundos.';"
+        "c.style.display='block';s.style.display='block';"
+        "try{"
+        "const r=await fetch('/reboot',{method:'POST'});"
+        "if(!r.ok)throw new Error(await r.text());"
+        "let left=20;c.textContent=left+'s';"
+        "const timer=setInterval(()=>{left--;c.textContent=left+'s';"
+        "if(left<=0){clearInterval(timer);location.reload()}},1000);"
+        "}catch(e){busy=false;c.style.display='none';s.style.display='none';"
+        "t.textContent='Nao foi possivel reiniciar';d.textContent=e.message||'Erro ao enviar comando.';"
+        "a.innerHTML=\"<button class='cancel' onclick='location.reload()'>Fechar</button>\";"
+        "a.style.display='flex';}}"
+        "setInterval(()=>{if(!busy&&!m.classList.contains('show'))location.reload()},10000);"
+        "</script></body></html>";
+
+    static char status[1400];
+    int n = snprintf(
+        status, sizeof(status),
+        "<div class='h'><div class='t'>Modem Watchdog</div><div class='b %s'>%s</div></div>"
         "<div class='p'><div class='g'>"
-        "<div class='s'><div class='l'>Wi-Fi</div><div class='v'><span class='dot'></span>%s</div></div>"
+        "<div class='s'><div class='l'>Wi-Fi</div><div class='v'><span class='dot %s'></span>%s</div></div>"
         "<div class='s'><div class='l'>Tailscale</div><div class='v'>%s</div></div>"
         "<div class='s'><div class='l'>Tailscale IP</div><div class='v'>%s</div></div>"
         "<div class='s'><div class='l'>Falhas</div><div class='v'>%d / %d</div></div>"
         "<div class='s'><div class='l'>Reboots auto</div><div class='v'>%d / %d</div></div>"
         "<div class='s'><div class='l'>Estado</div><div class='v'>%s</div></div>"
-        "</div><a class='a' href='/health'>Ver JSON de health →</a>"
-        "<form method='POST' action='/reboot' onsubmit=\"return confirm('Reiniciar o modem agora?')\">"
-        "<button class='btn' type='submit'>Reiniciar modem</button></form>"
-        "<div class='n'>A energia sera cortada por 20 segundos · atualiza a cada 10s</div>"
-        "</div></div></body></html>",
-        healthy ? "#2f9e44" : "#d9485f",
-        wifi_ok ? "#2f9e44" : "#d9485f",
+        "</div><a class='a' href='/health'>Ver JSON de health &#8594;</a>"
+        "<button class='btn' type='button' onclick='openModal()'>Reiniciar modem</button>"
+        "<div class='n'>A energia sera cortada por 20 segundos · status atualiza a cada 10s</div>"
+        "</div>",
+        healthy ? "ok" : "bad",
         healthy ? "ONLINE" : "ATENCAO",
+        wifi_ok ? "ok" : "bad",
         wifi_ok ? "conectado" : "desconectado",
         tailscale_ok ? "conectado" : "desconectado",
         vpn_ip,
@@ -347,13 +395,18 @@ static esp_err_t root_handler(httpd_req_t *req) {
         automatic_reboots, MAX_AUTO_REBOOTS,
         watchdog_state_name(wd_state));
 
-    if (n < 0 || n >= (int)sizeof(html)) {
-        ESP_LOGE(TAG, "Watchdog UI HTML overflow (%d bytes)", n);
+    if (n < 0 || n >= (int)sizeof(status)) {
+        ESP_LOGE(TAG, "Watchdog UI status overflow (%d bytes)", n);
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    if (httpd_resp_send_chunk(req, head, HTTPD_RESP_USE_STRLEN) != ESP_OK ||
+        httpd_resp_send_chunk(req, status, HTTPD_RESP_USE_STRLEN) != ESP_OK ||
+        httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t health_handler(httpd_req_t *req) {
