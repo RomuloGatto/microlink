@@ -1551,6 +1551,88 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     return count;
 }
 
+/* Remove a large top-level object field from compact JSON without allocating.
+ * This is used on classic ESP32 targets where cJSON cannot afford to build a
+ * tree for Headscale's full DERPMap. The scanner only needs to match the outer
+ * object braces and correctly ignores braces inside JSON strings. */
+static size_t strip_json_object_field_in_place(char *json, size_t *json_len,
+                                                const char *field) {
+    if (!json || !json_len || !field || *json_len == 0) return 0;
+
+    char needle[40];
+    int needle_len = snprintf(needle, sizeof(needle), "\"%s\"", field);
+    if (needle_len <= 0 || needle_len >= (int)sizeof(needle)) return 0;
+
+    char *end = json + *json_len;
+    char *key = strstr(json, needle);
+    if (!key || key >= end) return 0;
+
+    char *p = key + needle_len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= end || *p != ':') return 0;
+    p++;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= end || *p != '{') return 0;
+
+    char *value_end = NULL;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    for (char *q = p; q < end; q++) {
+        char ch = *q;
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            depth++;
+        } else if (ch == '}') {
+            depth--;
+            if (depth == 0) {
+                value_end = q + 1;
+                break;
+            }
+        }
+    }
+
+    if (!value_end) return 0;
+
+    char *remove_start = key;
+    char *remove_end = value_end;
+
+    /* Prefer consuming a following comma. If this is the final root member,
+     * consume the preceding comma instead. */
+    char *q = value_end;
+    while (q < end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (q < end && *q == ',') {
+        remove_end = q + 1;
+    } else {
+        q = key;
+        while (q > json &&
+               (q[-1] == ' ' || q[-1] == '\t' || q[-1] == '\r' || q[-1] == '\n')) {
+            q--;
+        }
+        if (q > json && q[-1] == ',') {
+            remove_start = q - 1;
+        }
+    }
+
+    size_t removed = (size_t)(remove_end - remove_start);
+    memmove(remove_start, remove_end, (size_t)(end - remove_end) + 1);
+    *json_len -= removed;
+    return removed;
+}
+
 static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streaming) {
     int64_t t_map_start = esp_timer_get_time();
 
@@ -1934,6 +2016,25 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
      * releases the unused tail without requiring another parse_len-sized block. */
     if (parse_start != (char *)h2_recv) {
         memmove(h2_recv, parse_start, parse_len);
+    }
+    h2_recv[parse_len] = '\0';
+
+    /* On classic ESP32/WROOM there is no PSRAM and the full DERPMap dominates
+     * cJSON's allocation cost. We do not need the complete global DERP catalog
+     * to establish the tailnet: DERP and STUN already have compiled fallbacks,
+     * while Node + Peers are the state that must be parsed successfully.
+     *
+     * Strip DERPMap before cJSON builds its tree. Boards with PSRAM keep the
+     * full map and retain dynamic DERP-region selection. */
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
+        size_t before = parse_len;
+        size_t removed =
+            strip_json_object_field_in_place((char *)h2_recv, &parse_len, "DERPMap");
+        if (removed > 0) {
+            ESP_LOGI(TAG,
+                     "Low-memory target: stripped DERPMap before JSON parse (%dKB -> %dKB)",
+                     (int)(before / 1024), (int)(parse_len / 1024));
+        }
     }
     h2_recv[parse_len] = '\0';
 
