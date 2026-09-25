@@ -343,6 +343,148 @@ static int do_tcp_connect(microlink_t *ml) {
 }
 
 /* ============================================================================
+ * Custom control-plane Noise key discovery
+ * ========================================================================== */
+
+static bool uses_custom_control_plane(const microlink_t *ml) {
+    const char *host = CTRL_HOST(ml);
+    return host && host[0] &&
+           strcmp(host, "controlplane.tailscale.com") != 0;
+}
+
+static int parse_control_noise_key_response(const char *resp,
+                                            uint8_t out_key[32]) {
+    if (!resp || !strstr(resp, " 200 ")) {
+        ESP_LOGE(TAG, "Noise key fetch returned non-200 response");
+        return -1;
+    }
+
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (!body) {
+        ESP_LOGE(TAG, "Noise key fetch response has no header terminator");
+        return -1;
+    }
+    body += 4;
+
+    /* Headscale/reverse proxies may use chunked HTTP/1.1. The /key response
+     * is tiny, so skipping the first chunk-size line is sufficient here. */
+    if (strstr(resp, "Transfer-Encoding: chunked") ||
+        strstr(resp, "transfer-encoding: chunked") ||
+        strstr(resp, "TRANSFER-ENCODING: CHUNKED")) {
+        const char *chunk_end = strstr(body, "\r\n");
+        if (!chunk_end) {
+            ESP_LOGE(TAG, "Noise key fetch returned malformed chunked body");
+            return -1;
+        }
+        body = chunk_end + 2;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        ESP_LOGE(TAG, "Noise key fetch JSON parse failed");
+        return -1;
+    }
+
+    cJSON *pk = cJSON_GetObjectItemCaseSensitive(root, "publicKey");
+    if (!cJSON_IsString(pk) || !pk->valuestring) {
+        ESP_LOGE(TAG, "Noise key fetch response has no publicKey");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    const char *hex = pk->valuestring;
+    if (strncmp(hex, "mkey:", 5) == 0) {
+        hex += 5;
+    }
+
+    if (strlen(hex) != 64 ||
+        hex_to_bytes(hex, out_key, 32) != 32) {
+        ESP_LOGE(TAG, "Noise publicKey is not a valid 32-byte hex key");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* Fetch /key over the already-established control-plane connection. The GET
+ * deliberately asks the server to close the connection; after parsing the
+ * key we reconnect and perform the Noise upgrade on a fresh connection. */
+static int fetch_control_noise_key(microlink_t *ml) {
+    char req[256];
+    int req_len = snprintf(req, sizeof(req),
+        "GET /key?v=%d HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: MicroLink\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        ML_CTRL_PROTOCOL_VER, CTRL_HOST(ml));
+
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        ESP_LOGE(TAG, "Noise key request overflow");
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Fetching Noise public key from %s/key?v=%d",
+             CTRL_HOST(ml), ML_CTRL_PROTOCOL_VER);
+
+    if (coord_send(ml, (const uint8_t *)req, (size_t)req_len) < 0) {
+        ESP_LOGE(TAG, "Noise key request send failed");
+        return -1;
+    }
+
+    char *resp = ml_psram_malloc(2048);
+    if (!resp) return -1;
+
+    int total = 0;
+    int idle_retries = 0;
+    while (total < 2047) {
+        int n = coord_raw_recv(ml, (uint8_t *)resp + total,
+                               (size_t)(2047 - total));
+        if (n > 0) {
+            total += n;
+            idle_retries = 0;
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (++idle_retries <= 20) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            break;
+        }
+        ESP_LOGE(TAG, "Noise key response read failed: errno=%d", errno);
+        free(resp);
+        return -1;
+    }
+
+    if (total <= 0) {
+        ESP_LOGE(TAG, "Noise key fetch returned an empty response");
+        free(resp);
+        return -1;
+    }
+
+    resp[total] = '\0';
+    int ret = parse_control_noise_key_response(resp, ml->ctrl_noise_pubkey);
+    free(resp);
+
+    if (ret == 0) {
+        ml->ctrl_noise_pubkey_set = true;
+        ESP_LOGI(TAG,
+                 "Noise public key discovered: %02x%02x%02x%02x...%02x%02x",
+                 ml->ctrl_noise_pubkey[0], ml->ctrl_noise_pubkey[1],
+                 ml->ctrl_noise_pubkey[2], ml->ctrl_noise_pubkey[3],
+                 ml->ctrl_noise_pubkey[30], ml->ctrl_noise_pubkey[31]);
+    }
+    return ret;
+}
+
+/* ============================================================================
  * State: NOISE_HANDSHAKE (HTTP/1.1 Upgrade with Noise msg1)
  * ========================================================================== */
 
@@ -353,14 +495,33 @@ static int s_server_extra_data_len = 0;
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
-    /* Initialize Noise with the selected control-plane server key.
-     * Priority: runtime config key > build-time Headscale key > built-in
-     * Tailscale key. */
+    /* Custom Headscale/Ionscale instances have their own Noise static key.
+     * Discover it from /key?v=<capability> on every new coordination
+     * connection so server-side key rotation recovers without reprovisioning
+     * the device. The /key request closes this connection by design, so open
+     * a fresh one before sending the Noise upgrade. */
+    if (uses_custom_control_plane(ml)) {
+        if (fetch_control_noise_key(ml) < 0) {
+            ESP_LOGE(TAG, "Automatic Noise public key discovery failed");
+            return -1;
+        }
+
+        coord_close_conn(ml);
+        if (do_tcp_connect(ml) < 0) {
+            ESP_LOGE(TAG, "Reconnect after Noise key discovery failed");
+            return -1;
+        }
+    }
+
     const uint8_t *server_key = NULL;
     if (ml->ctrl_noise_pubkey_set) {
         server_key = ml->ctrl_noise_pubkey;
     }
+
 #ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+    /* Retain the build-time key only as a compatibility fallback for custom
+     * integrations that do not expose /key. Normal custom control planes use
+     * the automatically discovered key above. */
     static uint8_t custom_server_key[32];
     if (!server_key && CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
         if (hex_to_bytes(CONFIG_ML_CTRL_NOISE_PUBKEY_HEX,
@@ -373,6 +534,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
         }
     }
 #endif
+
     ml_noise_init(noise,
                    ml->machine_private_key, ml->machine_public_key,
                    server_key);
