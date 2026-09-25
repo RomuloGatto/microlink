@@ -1296,6 +1296,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    app_config_load();
+
     ESP_LOGI(TAG, "Starting modem watchdog + MicroLink subnet router");
 
     wifi_init();
