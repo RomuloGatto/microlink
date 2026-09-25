@@ -1060,8 +1060,18 @@ static void start_http_server(void) {
 static void build_wifi_config(wifi_config_t *cfg,
                               const char *ssid, const char *password) {
     memset(cfg, 0, sizeof(*cfg));
-    copy_str((char *)cfg->sta.ssid, sizeof(cfg->sta.ssid), ssid);
-    copy_str((char *)cfg->sta.password, sizeof(cfg->sta.password), password);
+
+    if (ssid) {
+        size_t len = strlen(ssid);
+        if (len > sizeof(cfg->sta.ssid)) len = sizeof(cfg->sta.ssid);
+        memcpy(cfg->sta.ssid, ssid, len);
+    }
+    if (password) {
+        size_t len = strlen(password);
+        if (len > sizeof(cfg->sta.password)) len = sizeof(cfg->sta.password);
+        memcpy(cfg->sta.password, password, len);
+    }
+
     cfg->sta.threshold.authmode =
         (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 }
