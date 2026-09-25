@@ -25,6 +25,7 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "esp_partition.h"
@@ -59,6 +60,10 @@ static const char *TAG = "modem_watchdog";
 #define DEFAULT_MAX_AUTO_REBOOTS       3U
 #define DEFAULT_REBOOT_WINDOW_S        7200U
 #define TCP_PROBE_TIMEOUT_MS           2500
+
+#define RESCUE_AP_PREFIX                "ModemWatchdog"
+#define RESCUE_AP_PASSWORD              "modemwatchdog"
+#define RESCUE_AP_IP                    "192.168.4.1"
 
 #define APP_CONFIG_NAMESPACE           "modem_cfg"
 #define APP_CONFIG_KEY                 "settings"
@@ -236,6 +241,8 @@ static char local_ip[16] = "";
 static microlink_t *ml = NULL;
 static httpd_handle_t http_server = NULL;
 static volatile bool ota_in_progress = false;
+static bool rescue_ap_active = false;
+static char rescue_ap_ssid[33] = "";
 
 static inline uint64_t now_ms(void) {
     return (uint64_t)(esp_timer_get_time() / 1000);
@@ -1006,8 +1013,7 @@ static const char DASHBOARD_HTML[] =
     "async function loadHealth(){\n"
     " try{\n"
     "  const r=await fetch('/health',{cache:'no-store'});if(!r.ok)return;const h=await r.json();\n"
-    "  $('st_wifi').innerHTML=dot(!!h.wifi,h.wifi?'conectado':'desconectado');\n"
-    "  $('st_local').textContent=h.local_ip||'-';$('st_ts').innerHTML=dot(!!h.tailscale_connected,h.tailscale_connected?'conectado':'desconectado');\n"
+    "  if(h.rescue_ap_active){$('st_wifi').textContent='configuracao';$('st_local').textContent=h.rescue_ap_ip||'192.168.4.1'}else{$('st_wifi').innerHTML=dot(!!h.wifi,h.wifi?'conectado':'desconectado');$('st_local').textContent=h.local_ip||'-'}$('st_ts').innerHTML=dot(!!h.tailscale_connected,h.tailscale_connected?'conectado':'desconectado');\n"
     "  $('st_ip').textContent=h.tailscale_ip||'-';$('st_fail').textContent=String(h.failures)+' / '+String(h.failures_limit);\n"
     "  $('st_reboots').textContent=String(h.auto_reboots)+' / '+String(h.auto_reboots_limit);stateName=h.state||'';stateLabel=h.state_label||h.state||'-';stateRemaining=Number(h.state_remaining_s||0);stateSyncMs=Date.now();renderState();\n"
     "  $('pending').classList.toggle('show',!!h.wifi_pending);if(h.modem_off_s)$('off_note').textContent=h.modem_off_s\n"
@@ -1091,13 +1097,15 @@ static esp_err_t health_handler(httpd_req_t *req) {
         esp_ota_get_state_partition(running_partition, &ota_state) == ESP_OK &&
         ota_state == ESP_OTA_IMG_PENDING_VERIFY;
 
-    char json[1024];
+    char json[1152];
     int n = snprintf(
         json, sizeof(json),
         "{\"state\":\"%s\",\"state_label\":\"%s\","
         "\"state_remaining_s\":%u,"
         "\"firmware_version\":\"%s\",\"ota_slot\":\"%s\","
         "\"ota_pending_verify\":%s,\"ota_in_progress\":%s,"
+        "\"wifi_provisioned\":%s,\"rescue_ap_active\":%s,"
+        "\"rescue_ap_ssid\":\"%s\",\"rescue_ap_ip\":\"%s\","
         "\"wifi\":%s,\"tailscale_connected\":%s,"
         "\"local_ip\":\"%s\",\"tailscale_ip\":\"%s\","
         "\"failures\":%d,\"failures_limit\":%u,"
@@ -1112,6 +1120,10 @@ static esp_err_t health_handler(httpd_req_t *req) {
         running_partition ? running_partition->label : "unknown",
         ota_pending_verify ? "true" : "false",
         ota_in_progress ? "true" : "false",
+        app_cfg.wifi_ssid[0] ? "true" : "false",
+        rescue_ap_active ? "true" : "false",
+        rescue_ap_active ? rescue_ap_ssid : "",
+        rescue_ap_active ? RESCUE_AP_IP : "",
         wifi_ok ? "true" : "false",
         tailscale_ok ? "true" : "false",
         local_ip,
@@ -1406,9 +1418,18 @@ static void wifi_pending_validation_task(void *arg) {
     }
 
     if (!app_cfg.prev_wifi_ssid[0]) {
-        ESP_LOGE(TAG, "Pending WiFi failed and no rollback network is available");
+        ESP_LOGE(TAG,
+                 "Initial WiFi provisioning failed; clearing credentials and returning to rescue AP");
+        app_cfg.wifi_ssid[0] = '\0';
+        app_cfg.wifi_pass[0] = '\0';
         app_cfg.wifi_pending = 0;
         app_config_save();
+
+        BaseType_t ok = xTaskCreate(
+            delayed_restart_task, "wifi_rescue_restart", 2048, NULL, 8, NULL);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Could not schedule restart into rescue AP");
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -1478,7 +1499,13 @@ static void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+
+    const bool needs_provisioning = app_cfg.wifi_ssid[0] == '\0';
+    if (needs_provisioning) {
+        esp_netif_create_default_wifi_ap();
+    } else {
+        esp_netif_create_default_wifi_sta();
+    }
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
@@ -1487,6 +1514,34 @@ static void wifi_init(void) {
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
+    if (needs_provisioning) {
+        uint8_t mac[6] = {0};
+        ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_STA));
+        snprintf(rescue_ap_ssid, sizeof(rescue_ap_ssid),
+                 RESCUE_AP_PREFIX "-%02X%02X", mac[4], mac[5]);
+
+        wifi_config_t ap_config = {0};
+        size_t ssid_len = strlen(rescue_ap_ssid);
+        memcpy(ap_config.ap.ssid, rescue_ap_ssid, ssid_len);
+        ap_config.ap.ssid_len = ssid_len;
+
+        size_t pass_len = strlen(RESCUE_AP_PASSWORD);
+        memcpy(ap_config.ap.password, RESCUE_AP_PASSWORD, pass_len);
+        ap_config.ap.channel = 1;
+        ap_config.ap.max_connection = 4;
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        rescue_ap_active = true;
+        ESP_LOGW(TAG,
+                 "No WiFi SSID configured; rescue AP started: SSID=%s password=%s IP=%s",
+                 rescue_ap_ssid, RESCUE_AP_PASSWORD, RESCUE_AP_IP);
+        return;
+    }
 
     wifi_config_t wifi_config;
     build_wifi_config(&wifi_config, app_cfg.wifi_ssid, app_cfg.wifi_pass);
