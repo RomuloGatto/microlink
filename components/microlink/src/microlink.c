@@ -379,6 +379,9 @@ static void ml_release(microlink_t *ml) {
     if (ml->disco_sock4 >= 0)  { ml_close_sock(ml->disco_sock4);  ml->disco_sock4 = -1; }
     if (ml->stun_sock >= 0)    { ml_close_sock(ml->stun_sock);    ml->stun_sock = -1; }
     if (ml->stun_sock6 >= 0)   { ml_close_sock(ml->stun_sock6);   ml->stun_sock6 = -1; }
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_free(ml);
+#endif
     if (ml->coord_sock >= 0)   { ml_close_sock(ml->coord_sock);   ml->coord_sock = -1; }
     if (ml->derp.sockfd >= 0)  { ml_close_sock(ml->derp.sockfd);  ml->derp.sockfd = -1; }
 
