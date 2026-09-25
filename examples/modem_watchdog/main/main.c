@@ -203,6 +203,7 @@ static uint64_t reboot_window_started_ms = 0;
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
+static char local_ip[16] = "";
 
 static microlink_t *ml = NULL;
 static httpd_handle_t http_server = NULL;
@@ -944,7 +945,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
         json, sizeof(json),
         "{\"state\":\"%s\",\"state_label\":\"%s\","
         "\"wifi\":%s,\"tailscale_connected\":%s,"
-        "\"tailscale_ip\":\"%s\","
+        "\"local_ip\":\"%s\",\"tailscale_ip\":\"%s\","
         "\"failures\":%d,\"failures_limit\":%u,"
         "\"auto_reboots\":%d,\"auto_reboots_limit\":%u,"
         "\"modem_off_s\":%u,\"modem_boot_s\":%u,"
@@ -953,6 +954,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
         watchdog_state_label(wd_state),
         wifi_ok ? "true" : "false",
         tailscale_ok ? "true" : "false",
+        local_ip,
         vpn_ip,
         consecutive_failures,
         (unsigned)app_cfg.failures_before_reboot,
@@ -1149,6 +1151,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        local_ip[0] = '\0';
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGW(TAG, "WiFi disconnected; reconnecting...");
         esp_wifi_connect();
@@ -1158,8 +1161,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        snprintf(local_ip, sizeof(local_ip), IPSTR, IP2STR(&event->ip_info.ip));
 
-        ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi got IP: %s", local_ip);
 
         /* The modem reboot changes the underlay while the ESP stays powered.
          * Rebind keeps the same Tailscale identity/session and rebuilds the
