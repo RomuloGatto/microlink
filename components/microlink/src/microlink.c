@@ -449,7 +449,8 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 #ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
     {
         const char *route = ml->config.advertise_route;
-        if ((!route || !route[0]) && CONFIG_ML_SUBNET_ROUTE[0] != '\0') {
+        if (!ml->config.advertise_route_override &&
+            (!route || !route[0]) && CONFIG_ML_SUBNET_ROUTE[0] != '\0') {
             route = CONFIG_ML_SUBNET_ROUTE;
         }
         if (route && route[0] && !ml_configure_subnet_route(ml, route)) {
