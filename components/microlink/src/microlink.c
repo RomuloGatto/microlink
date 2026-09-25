@@ -433,6 +433,15 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 
     /* Copy config */
     ml->config = *config;
+
+#ifndef CONFIG_ML_CTRL_TLS
+    if (ml->config.ctrl_tls_override && ml->config.ctrl_tls) {
+        ESP_LOGE(TAG,
+                 "Runtime control-plane TLS requested, but CONFIG_ML_CTRL_TLS is disabled");
+        free(ml);
+        return NULL;
+    }
+#endif
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
