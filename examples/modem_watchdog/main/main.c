@@ -431,6 +431,7 @@ static void watchdog_task(void *arg) {
         update_reboot_state(now);
 
         if (!ota_in_progress &&
+            app_cfg.wifi_ssid[0] != '\0' &&
             wd_state == WD_NORMAL &&
             now - last_internet_check_ms >= cfg_check_interval_ms()) {
             last_internet_check_ms = now;
