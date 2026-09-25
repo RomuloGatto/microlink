@@ -45,6 +45,12 @@ typedef struct {
      * internet exit node. */
     const char *advertise_route;
 
+    /* When false (default), an empty advertise_route falls back to the
+     * CONFIG_ML_SUBNET_ROUTE Kconfig value for backwards compatibility.
+     * Set true to make advertise_route authoritative at runtime; an empty
+     * string then explicitly disables subnet routing for this instance. */
+    bool advertise_route_override;
+
     /* Priority peer: guaranteed a WG slot even when peer table is full.
      * On large tailnets the NVS cache can fill the peer table at boot
      * before the priority peer arrives from MapResponse. When the table
@@ -63,6 +69,14 @@ typedef struct {
      * to 32 raw bytes and overrides CONFIG_ML_CTRL_NOISE_PUBKEY_HEX. */
     const char *ctrl_host;
     const uint8_t *ctrl_noise_pubkey;
+
+    /* Optional runtime TLS selection for custom control planes.
+     * Existing callers keep the compiled CONFIG_ML_CTRL_TLS behavior because
+     * ctrl_tls_override defaults to false. When true, ctrl_tls selects
+     * HTTPS/TLS (port 443) vs plain HTTP/TCP (port 80). TLS can only be
+     * enabled at runtime when CONFIG_ML_CTRL_TLS is compiled in. */
+    bool ctrl_tls_override;
+    bool ctrl_tls;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
