@@ -890,7 +890,7 @@ static const char DASHBOARD_HTML[] =
     "const $=id=>document.getElementById(id);\n"
     "let busy=false,settings={},healthTimer=null,countTimer=null,stateTickTimer=null,baseline='',stateName='',stateLabel='',stateRemaining=0,stateSyncMs=0;\n"
     "function formatCountdown(sec){sec=Math.max(0,Math.ceil(sec));const m=Math.floor(sec/60),s=sec%60;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}\n"
-    "function renderState(){const el=$('st_state');if(!el)return;let html=stateLabel||stateName||'-';if(stateName==='waiting-for-modem'&&stateRemaining>0){const elapsed=Math.floor((Date.now()-stateSyncMs)/1000),left=Math.max(0,stateRemaining-elapsed);html+='<span class=\'state-countdown\'>'+formatCountdown(left)+'</span>';if(left===0)setTimeout(loadHealth,250)}el.innerHTML=html;el.classList.toggle('state-warn',stateName!=='monitoring')}\n"
+    "function renderState(){const el=$('st_state');if(!el)return;let html=stateLabel||stateName||'-';if(stateName==='waiting-for-modem'&&stateRemaining>0){const elapsed=Math.floor((Date.now()-stateSyncMs)/1000),left=Math.max(0,stateRemaining-elapsed);html+=\"<span class='state-countdown'>\"+formatCountdown(left)+\"</span>\";if(left===0)setTimeout(loadHealth,250)}el.innerHTML=html;el.classList.toggle('state-warn',stateName!=='monitoring')}\n"
     "function toast(msg,type){const el=$('toast');el.textContent=msg;el.className='toast show '+(type||'success');clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast',3000)}\n"
     "function dot(ok,label){return \"<span class='dot \"+(ok?'ok':'bad')+\"'></span>\"+label}\n"
     "function setv(id,v){$(id).value=v==null?'':v}\n"
