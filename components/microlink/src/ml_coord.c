@@ -717,28 +717,51 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
  * State: H2_PREFACE - Send HTTP/2 connection preface (Noise-encrypted)
  * ========================================================================== */
 
-/* Choose the H2 recv/JSON-parse window for this connect cycle: the largest
- * contiguous free block we can find (SPIRAM preferred, internal as fallback),
- * minus a safety margin, clamped to [64KB, ML_H2_BUFFER_SIZE] and rounded
- * down to 1KB. do_fetch_peers() allocates exactly one buffer this size and
- * uses it for both the raw H2 receive and the compacted JSON -- keeping this
- * window under what's actually free avoids fragmenting the rest of PSRAM on
- * RAM-constrained boards. Ported from djorr5/microlink's `67b230b2`. */
+/* Choose the H2 receive window for this connect cycle from what can
+ * actually be allocated right now.
+ *
+ * Classic ESP32/WROOM has no PSRAM. Once WireGuard + DERP are already alive,
+ * reconnects can leave the largest contiguous internal block around 40-50KB.
+ * The previous code forced a 64KB minimum even when the largest free block was
+ * only 44KB, so do_fetch_peers() failed its allocation immediately and the
+ * control plane entered a reconnect loop.
+ *
+ * Keep 16KB of contiguous headroom for Noise/lwIP/task allocations and use a
+ * 24KB minimum when possible. Our current Headscale initial netmap is ~20KB,
+ * so this is enough on the WROOM while still allowing 64KB on a fresh boot or
+ * boards with PSRAM. */
 static void choose_h2_rx_window_size(microlink_t *ml) {
     size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    size_t largest_any = psram_largest > internal_largest ? psram_largest : internal_largest;
+    size_t internal_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_any =
+        psram_largest > internal_largest ? psram_largest : internal_largest;
 
-    const size_t margin = 32 * 1024;
-    const size_t floor = 64 * 1024;
-    size_t window = (largest_any > margin) ? (largest_any - margin) : 0;
-    if (window < floor) window = floor;
-    if (window > ML_H2_BUFFER_SIZE) window = ML_H2_BUFFER_SIZE;
+    const size_t reserve = 16 * 1024;
+    const size_t min_window = 24 * 1024;
+
+    size_t window = 0;
+    if (largest_any > reserve) {
+        window = largest_any - reserve;
+    }
+    if (window > ML_H2_BUFFER_SIZE) {
+        window = ML_H2_BUFFER_SIZE;
+    }
+
+    /* If the reserve calculation dipped below the useful minimum but the
+     * allocator can still fit 24KB with a little breathing room, use 24KB. */
+    if (window < min_window && largest_any >= (min_window + 4 * 1024)) {
+        window = min_window;
+    }
+
     window &= ~(size_t)1023;  /* round down to 1KB */
-
     ml->h2_rx_window_size = (uint32_t)window;
-    ESP_LOGI(TAG, "H2 rx window: %luKB (largest free block %luKB, ceiling %luKB)",
-             (unsigned long)(window / 1024), (unsigned long)(largest_any / 1024),
+
+    ESP_LOGI(TAG,
+             "H2 rx window: %luKB (largest free block %luKB, reserve %luKB, ceiling %luKB)",
+             (unsigned long)(window / 1024),
+             (unsigned long)(largest_any / 1024),
+             (unsigned long)(reserve / 1024),
              (unsigned long)(ML_H2_BUFFER_SIZE / 1024));
 }
 
@@ -1622,9 +1645,23 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
      * without PSRAM we receive directly into the remaining tail of this buffer;
      * if a response cannot fit, this connection is discarded and retried rather
      * than allocating a second 64KB scratch buffer. */
-    uint32_t h2_window = ml->h2_rx_window_size ? ml->h2_rx_window_size : ML_H2_BUFFER_SIZE;
+    uint32_t h2_window =
+        ml->h2_rx_window_size ? ml->h2_rx_window_size : ML_H2_BUFFER_SIZE;
+    if (h2_window < 16 * 1024) {
+        ESP_LOGE(TAG, "Not enough contiguous heap for MapResponse buffer: %luKB",
+                 (unsigned long)(h2_window / 1024));
+        return -1;
+    }
+
     uint8_t *h2_recv = ml_psram_malloc(h2_window);
-    if (!h2_recv) return -1;
+    if (!h2_recv) {
+        ESP_LOGE(TAG,
+                 "Failed to allocate %luKB MapResponse buffer (largest=%luKB total=%luKB)",
+                 (unsigned long)(h2_window / 1024),
+                 (unsigned long)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+                 (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+        return -1;
+    }
     size_t h2_total = 0;
     size_t json_total = 0;
 
