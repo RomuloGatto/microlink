@@ -148,6 +148,54 @@ static void *cjson_psram_malloc(size_t size) {
 }
 
 /* ============================================================================
+ * Subnet Router Configuration
+ * ========================================================================== */
+
+static bool ml_configure_subnet_route(microlink_t *ml, const char *cidr) {
+    if (!ml || !cidr || !cidr[0]) {
+        return false;
+    }
+
+    unsigned a, b, c, d, prefix;
+    char trailing;
+    if (sscanf(cidr, "%u.%u.%u.%u/%u%c", &a, &b, &c, &d, &prefix, &trailing) != 5 ||
+        a > 255 || b > 255 || c > 255 || d > 255 || prefix == 0 || prefix > 32) {
+        ESP_LOGE(TAG, "Invalid subnet route '%s' (expected IPv4 CIDR, /1..32)", cidr);
+        return false;
+    }
+
+    uint32_t ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                  ((uint32_t)c << 8) | (uint32_t)d;
+    uint32_t mask = (prefix == 32) ? UINT32_MAX : (UINT32_MAX << (32 - prefix));
+    uint32_t network = ip & mask;
+
+    /* 100.64.0.0/10 is the tailnet address space itself. Advertising a route
+     * that overlaps it would create ambiguous cryptokey routing and is never
+     * a valid LAN subnet-router configuration. */
+    const uint32_t ts_net = 0x64400000u;   /* 100.64.0.0 */
+    const uint32_t ts_mask = 0xFFC00000u;  /* /10 */
+    if ((network & ts_mask) == ts_net || (ts_net & mask) == network) {
+        ESP_LOGE(TAG, "Subnet route '%s' overlaps Tailscale CGNAT range 100.64.0.0/10", cidr);
+        return false;
+    }
+
+    unsigned na = (network >> 24) & 0xFF;
+    unsigned nb = (network >> 16) & 0xFF;
+    unsigned nc = (network >> 8) & 0xFF;
+    unsigned nd = network & 0xFF;
+    snprintf(ml->subnet_route_cidr, sizeof(ml->subnet_route_cidr),
+             "%u.%u.%u.%u/%u", na, nb, nc, nd, prefix);
+
+    ml->subnet_route_ip = network;
+    ml->subnet_route_prefix_len = (uint8_t)prefix;
+    ml->subnet_router_enabled = true;
+    ml->config.advertise_route = ml->subnet_route_cidr;
+
+    ESP_LOGI(TAG, "Subnet router configured: advertising %s", ml->subnet_route_cidr);
+    return true;
+}
+
+/* ============================================================================
  * Credential Check
  * ========================================================================== */
 
@@ -331,6 +379,9 @@ static void ml_release(microlink_t *ml) {
     if (ml->disco_sock4 >= 0)  { ml_close_sock(ml->disco_sock4);  ml->disco_sock4 = -1; }
     if (ml->stun_sock >= 0)    { ml_close_sock(ml->stun_sock);    ml->stun_sock = -1; }
     if (ml->stun_sock6 >= 0)   { ml_close_sock(ml->stun_sock6);   ml->stun_sock6 = -1; }
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_free(ml);
+#endif
     if (ml->coord_sock >= 0)   { ml_close_sock(ml->coord_sock);   ml->coord_sock = -1; }
     if (ml->derp.sockfd >= 0)  { ml_close_sock(ml->derp.sockfd);  ml->derp.sockfd = -1; }
 
@@ -382,9 +433,49 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 
     /* Copy config */
     ml->config = *config;
+
+#ifndef CONFIG_ML_CTRL_TLS
+    if (ml->config.ctrl_tls_override && ml->config.ctrl_tls) {
+        ESP_LOGE(TAG,
+                 "Runtime control-plane TLS requested, but CONFIG_ML_CTRL_TLS is disabled");
+        free(ml);
+        return NULL;
+    }
+#endif
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
+
+    if (config->ctrl_host && config->ctrl_host[0]) {
+        strncpy(ml->ctrl_host, config->ctrl_host, sizeof(ml->ctrl_host) - 1);
+        ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
+    }
+    if (config->ctrl_noise_pubkey) {
+        memcpy(ml->ctrl_noise_pubkey, config->ctrl_noise_pubkey, 32);
+        ml->ctrl_noise_pubkey_set = true;
+    }
+
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+    {
+        const char *route = ml->config.advertise_route;
+        if (!ml->config.advertise_route_override &&
+            (!route || !route[0]) && CONFIG_ML_SUBNET_ROUTE[0] != '\0') {
+            route = CONFIG_ML_SUBNET_ROUTE;
+        }
+        if (route && route[0] && !ml_configure_subnet_route(ml, route)) {
+            free(ml);
+            return NULL;
+        }
+    }
+#else
+    if (ml->config.advertise_route && ml->config.advertise_route[0]) {
+        ESP_LOGE(TAG,
+                 "advertise_route='%s' requested, but CONFIG_ML_ENABLE_SUBNET_ROUTER is disabled",
+                 ml->config.advertise_route);
+        free(ml);
+        return NULL;
+    }
+#endif
 
     ml->state = ML_STATE_IDLE;
     ml->coord_sock = -1;

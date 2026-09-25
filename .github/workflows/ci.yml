@@ -74,6 +74,22 @@ jobs:
           path: "examples/${{ matrix.example }}"
           command: "idf.py build"
 
+  watchdog-example:
+    name: "build modem_watchdog (esp32)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.1
+          target: esp32
+          path: "examples/modem_watchdog"
+          command: "idf.py build"
+
   config-variants:
     name: "build ${{ matrix.variant }}"
     runs-on: ubuntu-latest
@@ -89,6 +105,8 @@ jobs:
           - variant: zerocopy
             base_example: basic_connect
           - variant: minimal
+            base_example: basic_connect
+          - variant: subnet-router
             base_example: basic_connect
           - variant: cellular-zerocopy
             base_example: cellular_connect

@@ -48,8 +48,39 @@ static const char *TAG = "ml_coord";
 static volatile bool s_captive_portal = false;
 #define ML_CAPTIVE_PORTAL_BACKOFF_MS  300000   /* 5 min */
 
-/* Effective control plane host: NVS override or compiled default */
+/* Effective control plane host: NVS/config override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
+
+static bool ctrl_tls_enabled(const microlink_t *ml) {
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml && ml->config.ctrl_tls_override) {
+        return ml->config.ctrl_tls;
+    }
+    return true;
+#else
+    (void)ml;
+    return false;
+#endif
+}
+
+static int coord_raw_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ctrl_tls_enabled(ml)) {
+        return ml_coord_tls_recv(ml, buf, len);
+    }
+#endif
+    return ml_recv(ml->coord_sock, buf, len, 0);
+}
+
+static void coord_close_conn(microlink_t *ml) {
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_free(ml);
+#endif
+    if (ml->coord_sock >= 0) {
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+    }
+}
 
 /* NodeKeyChallenge from EarlyNoise (stored between handshake and register) */
 static uint8_t s_node_key_challenge[32] = {0};
@@ -102,6 +133,15 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     struct timeval snd_tv = { .tv_sec = 5, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ctrl_tls_enabled(ml)) {
+        if (ml_coord_tls_send(ml, data, len) < 0) {
+            ESP_LOGE(TAG, "coord_send (TLS) failed: len=%d errno=%d", (int)len, errno);
+            return -1;
+        }
+        return 0;
+    }
+#endif
     size_t sent = 0;
     while (sent < len) {
         int n = ml_send(ml->coord_sock, data + sent, len - sent, 0);
@@ -119,7 +159,7 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
-        int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
+        int n = coord_raw_recv(ml, buf + recvd, len - recvd);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
@@ -239,7 +279,9 @@ static int do_tcp_connect(microlink_t *ml) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
+    const char *ctrl_port = ctrl_tls_enabled(ml) ? "443" : "80";
+
+    if (ml_getaddrinfo(CTRL_HOST(ml), ctrl_port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
         return -1;
     }
@@ -269,7 +311,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%s...", CTRL_HOST(ml), ctrl_port);
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -284,7 +326,162 @@ static int do_tcp_connect(microlink_t *ml) {
              (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
 
     ml->coord_sock = sock;
+
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ctrl_tls_enabled(ml)) {
+        if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
+            coord_close_conn(ml);
+            return -1;
+        }
+        int64_t t_tls = esp_timer_get_time();
+        ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms",
+                 (t_tls - t_tcp) / 1000);
+    }
+#endif
+
     return 0;
+}
+
+/* ============================================================================
+ * Custom control-plane Noise key discovery
+ * ========================================================================== */
+
+static bool uses_custom_control_plane(const microlink_t *ml) {
+    const char *host = CTRL_HOST(ml);
+    return host && host[0] &&
+           strcmp(host, "controlplane.tailscale.com") != 0;
+}
+
+static int parse_control_noise_key_response(const char *resp,
+                                            uint8_t out_key[32]) {
+    if (!resp || !strstr(resp, " 200 ")) {
+        ESP_LOGE(TAG, "Noise key fetch returned non-200 response");
+        return -1;
+    }
+
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (!body) {
+        ESP_LOGE(TAG, "Noise key fetch response has no header terminator");
+        return -1;
+    }
+    body += 4;
+
+    /* Headscale/reverse proxies may use chunked HTTP/1.1. The /key response
+     * is tiny, so skipping the first chunk-size line is sufficient here. */
+    if (strstr(resp, "Transfer-Encoding: chunked") ||
+        strstr(resp, "transfer-encoding: chunked") ||
+        strstr(resp, "TRANSFER-ENCODING: CHUNKED")) {
+        const char *chunk_end = strstr(body, "\r\n");
+        if (!chunk_end) {
+            ESP_LOGE(TAG, "Noise key fetch returned malformed chunked body");
+            return -1;
+        }
+        body = chunk_end + 2;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        ESP_LOGE(TAG, "Noise key fetch JSON parse failed");
+        return -1;
+    }
+
+    cJSON *pk = cJSON_GetObjectItemCaseSensitive(root, "publicKey");
+    if (!cJSON_IsString(pk) || !pk->valuestring) {
+        ESP_LOGE(TAG, "Noise key fetch response has no publicKey");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    const char *hex = pk->valuestring;
+    if (strncmp(hex, "mkey:", 5) == 0) {
+        hex += 5;
+    }
+
+    if (strlen(hex) != 64 ||
+        hex_to_bytes(hex, out_key, 32) != 32) {
+        ESP_LOGE(TAG, "Noise publicKey is not a valid 32-byte hex key");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* Fetch /key over the already-established control-plane connection. The GET
+ * deliberately asks the server to close the connection; after parsing the
+ * key we reconnect and perform the Noise upgrade on a fresh connection. */
+static int fetch_control_noise_key(microlink_t *ml) {
+    char req[256];
+    int req_len = snprintf(req, sizeof(req),
+        "GET /key?v=%d HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: MicroLink\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        ML_CTRL_PROTOCOL_VER, CTRL_HOST(ml));
+
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        ESP_LOGE(TAG, "Noise key request overflow");
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Fetching Noise public key from %s/key?v=%d",
+             CTRL_HOST(ml), ML_CTRL_PROTOCOL_VER);
+
+    if (coord_send(ml, (const uint8_t *)req, (size_t)req_len) < 0) {
+        ESP_LOGE(TAG, "Noise key request send failed");
+        return -1;
+    }
+
+    char *resp = ml_psram_malloc(2048);
+    if (!resp) return -1;
+
+    int total = 0;
+    int idle_retries = 0;
+    while (total < 2047) {
+        int n = coord_raw_recv(ml, (uint8_t *)resp + total,
+                               (size_t)(2047 - total));
+        if (n > 0) {
+            total += n;
+            idle_retries = 0;
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (++idle_retries <= 20) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            break;
+        }
+        ESP_LOGE(TAG, "Noise key response read failed: errno=%d", errno);
+        free(resp);
+        return -1;
+    }
+
+    if (total <= 0) {
+        ESP_LOGE(TAG, "Noise key fetch returned an empty response");
+        free(resp);
+        return -1;
+    }
+
+    resp[total] = '\0';
+    int ret = parse_control_noise_key_response(resp, ml->ctrl_noise_pubkey);
+    free(resp);
+
+    if (ret == 0) {
+        ml->ctrl_noise_pubkey_set = true;
+        ESP_LOGI(TAG,
+                 "Noise public key discovered: %02x%02x%02x%02x...%02x%02x",
+                 ml->ctrl_noise_pubkey[0], ml->ctrl_noise_pubkey[1],
+                 ml->ctrl_noise_pubkey[2], ml->ctrl_noise_pubkey[3],
+                 ml->ctrl_noise_pubkey[30], ml->ctrl_noise_pubkey[31]);
+    }
+    return ret;
 }
 
 /* ============================================================================
@@ -298,10 +495,49 @@ static int s_server_extra_data_len = 0;
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
-    /* Initialize Noise state with our machine key and Tailscale's server key */
+    /* Custom Headscale/Ionscale instances have their own Noise static key.
+     * Discover it from /key?v=<capability> on every new coordination
+     * connection so server-side key rotation recovers without reprovisioning
+     * the device. The /key request closes this connection by design, so open
+     * a fresh one before sending the Noise upgrade. */
+    if (uses_custom_control_plane(ml)) {
+        if (fetch_control_noise_key(ml) < 0) {
+            ESP_LOGE(TAG, "Automatic Noise public key discovery failed");
+            return -1;
+        }
+
+        coord_close_conn(ml);
+        if (do_tcp_connect(ml) < 0) {
+            ESP_LOGE(TAG, "Reconnect after Noise key discovery failed");
+            return -1;
+        }
+    }
+
+    const uint8_t *server_key = NULL;
+    if (ml->ctrl_noise_pubkey_set) {
+        server_key = ml->ctrl_noise_pubkey;
+    }
+
+#ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+    /* Retain the build-time key only as a compatibility fallback for custom
+     * integrations that do not expose /key. Normal custom control planes use
+     * the automatically discovered key above. */
+    static uint8_t custom_server_key[32];
+    if (!server_key && CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
+        if (hex_to_bytes(CONFIG_ML_CTRL_NOISE_PUBKEY_HEX,
+                         custom_server_key, sizeof(custom_server_key)) == 32) {
+            server_key = custom_server_key;
+        } else {
+            ESP_LOGE(TAG,
+                     "Invalid ML_CTRL_NOISE_PUBKEY_HEX (expected exactly 64 hex chars)");
+            return -1;
+        }
+    }
+#endif
+
     ml_noise_init(noise,
                    ml->machine_private_key, ml->machine_public_key,
-                   NULL);  /* NULL = use default Tailscale server key */
+                   server_key);
 
     /* Build Noise message 1 (101 bytes) */
     uint8_t msg1[128];
@@ -346,7 +582,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp = ml_psram_malloc(2048);
     if (!resp) return -1;
 
-    int total = ml_recv(ml->coord_sock, resp, 2047, 0);
+    int total = coord_raw_recv(ml, resp, 2047);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
         /* Some captive portals close the TCP connection immediately instead
@@ -492,7 +728,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
-            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            int n = coord_raw_recv(ml, extra_data, 1024);
             if (n > 0) {
                 extra_len = n;
                 ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
@@ -655,28 +891,51 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
  * State: H2_PREFACE - Send HTTP/2 connection preface (Noise-encrypted)
  * ========================================================================== */
 
-/* Choose the H2 recv/JSON-parse window for this connect cycle: the largest
- * contiguous free block we can find (SPIRAM preferred, internal as fallback),
- * minus a safety margin, clamped to [64KB, ML_H2_BUFFER_SIZE] and rounded
- * down to 1KB. do_fetch_peers() allocates exactly one buffer this size and
- * uses it for both the raw H2 receive and the compacted JSON -- keeping this
- * window under what's actually free avoids fragmenting the rest of PSRAM on
- * RAM-constrained boards. Ported from djorr5/microlink's `67b230b2`. */
+/* Choose the H2 receive window for this connect cycle from what can
+ * actually be allocated right now.
+ *
+ * Classic ESP32/WROOM has no PSRAM. Once WireGuard + DERP are already alive,
+ * reconnects can leave the largest contiguous internal block around 40-50KB.
+ * The previous code forced a 64KB minimum even when the largest free block was
+ * only 44KB, so do_fetch_peers() failed its allocation immediately and the
+ * control plane entered a reconnect loop.
+ *
+ * Keep 16KB of contiguous headroom for Noise/lwIP/task allocations and use a
+ * 24KB minimum when possible. Our current Headscale initial netmap is ~20KB,
+ * so this is enough on the WROOM while still allowing 64KB on a fresh boot or
+ * boards with PSRAM. */
 static void choose_h2_rx_window_size(microlink_t *ml) {
     size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    size_t largest_any = psram_largest > internal_largest ? psram_largest : internal_largest;
+    size_t internal_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_any =
+        psram_largest > internal_largest ? psram_largest : internal_largest;
 
-    const size_t margin = 32 * 1024;
-    const size_t floor = 64 * 1024;
-    size_t window = (largest_any > margin) ? (largest_any - margin) : 0;
-    if (window < floor) window = floor;
-    if (window > ML_H2_BUFFER_SIZE) window = ML_H2_BUFFER_SIZE;
+    const size_t reserve = 16 * 1024;
+    const size_t min_window = 24 * 1024;
+
+    size_t window = 0;
+    if (largest_any > reserve) {
+        window = largest_any - reserve;
+    }
+    if (window > ML_H2_BUFFER_SIZE) {
+        window = ML_H2_BUFFER_SIZE;
+    }
+
+    /* If the reserve calculation dipped below the useful minimum but the
+     * allocator can still fit 24KB with a little breathing room, use 24KB. */
+    if (window < min_window && largest_any >= (min_window + 4 * 1024)) {
+        window = min_window;
+    }
+
     window &= ~(size_t)1023;  /* round down to 1KB */
-
     ml->h2_rx_window_size = (uint32_t)window;
-    ESP_LOGI(TAG, "H2 rx window: %luKB (largest free block %luKB, ceiling %luKB)",
-             (unsigned long)(window / 1024), (unsigned long)(largest_any / 1024),
+
+    ESP_LOGI(TAG,
+             "H2 rx window: %luKB (largest free block %luKB, reserve %luKB, ceiling %luKB)",
+             (unsigned long)(window / 1024),
+             (unsigned long)(largest_any / 1024),
+             (unsigned long)(reserve / 1024),
              (unsigned long)(ML_H2_BUFFER_SIZE / 1024));
 }
 
@@ -697,12 +956,14 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
     if (ack_len < 0) return -1;
     pos += ack_len;
 
-    /* Connection-level WINDOW_UPDATE (stream 0) to expand the connection window
-     * beyond the 65535 default. SETTINGS INITIAL_WINDOW_SIZE only sets per-stream
-     * window; the connection-level window starts at 65535 and must be explicitly
-     * expanded with WINDOW_UPDATE on stream 0. */
-    uint32_t conn_window_delta = h2_window - 65535;
-    if (conn_window_delta > 0) {
+    /* The HTTP/2 connection window always starts at 65535 and cannot be
+     * reduced with WINDOW_UPDATE. When RAM pressure makes our receive window
+     * smaller than 64KB, only advertise the smaller per-stream
+     * INITIAL_WINDOW_SIZE above. Do not subtract with unsigned math here:
+     * h2_window < 65535 would underflow into an invalid ~4GB increment and
+     * make the server close the connection. */
+    if (h2_window > 65535) {
+        uint32_t conn_window_delta = h2_window - 65535;
         int wu_len = ml_h2_build_window_update(h2_init + pos, sizeof(h2_init) - pos,
                                                 0, conn_window_delta);
         if (wu_len > 0) pos += wu_len;
@@ -732,6 +993,10 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
 
     return 0;
 }
+
+/* Advertise the configured subnet route in Hostinfo.RoutableIPs.
+ * Defined below with the MapRequest JSON helpers. */
+static void add_routable_ips_to_hostinfo(microlink_t *ml, cJSON *hostinfo);
 
 /* ============================================================================
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
@@ -770,6 +1035,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+    add_routable_ips_to_hostinfo(ml, hostinfo);
 
     /* NetInfo inside Hostinfo — control plane reads PreferredDERP from here
      * to populate Node.HomeDERP for other peers */
@@ -1358,6 +1624,21 @@ check_removed:
     }
 }
 
+/* Advertise the configured LAN prefix using the same Hostinfo.RoutableIPs
+ * field as native tailscaled's AdvertiseRoutes preference. The control plane
+ * still owns route approval/policy; this only announces capability. */
+static void add_routable_ips_to_hostinfo(microlink_t *ml, cJSON *hostinfo) {
+    if (!ml || !hostinfo || !ml->subnet_router_enabled || !ml->subnet_route_cidr[0]) {
+        return;
+    }
+
+    cJSON *routes = cJSON_AddArrayToObject(hostinfo, "RoutableIPs");
+    if (!routes) {
+        return;
+    }
+    cJSON_AddItemToArray(routes, cJSON_CreateString(ml->subnet_route_cidr));
+}
+
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
  * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
@@ -1432,7 +1713,89 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     return count;
 }
 
-static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
+/* Remove a large top-level object field from compact JSON without allocating.
+ * This is used on classic ESP32 targets where cJSON cannot afford to build a
+ * tree for Headscale's full DERPMap. The scanner only needs to match the outer
+ * object braces and correctly ignores braces inside JSON strings. */
+static size_t strip_json_object_field_in_place(char *json, size_t *json_len,
+                                                const char *field) {
+    if (!json || !json_len || !field || *json_len == 0) return 0;
+
+    char needle[40];
+    int needle_len = snprintf(needle, sizeof(needle), "\"%s\"", field);
+    if (needle_len <= 0 || needle_len >= (int)sizeof(needle)) return 0;
+
+    char *end = json + *json_len;
+    char *key = strstr(json, needle);
+    if (!key || key >= end) return 0;
+
+    char *p = key + needle_len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= end || *p != ':') return 0;
+    p++;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= end || *p != '{') return 0;
+
+    char *value_end = NULL;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    for (char *q = p; q < end; q++) {
+        char ch = *q;
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            depth++;
+        } else if (ch == '}') {
+            depth--;
+            if (depth == 0) {
+                value_end = q + 1;
+                break;
+            }
+        }
+    }
+
+    if (!value_end) return 0;
+
+    char *remove_start = key;
+    char *remove_end = value_end;
+
+    /* Prefer consuming a following comma. If this is the final root member,
+     * consume the preceding comma instead. */
+    char *q = value_end;
+    while (q < end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (q < end && *q == ',') {
+        remove_end = q + 1;
+    } else {
+        q = key;
+        while (q > json &&
+               (q[-1] == ' ' || q[-1] == '\t' || q[-1] == '\r' || q[-1] == '\n')) {
+            q--;
+        }
+        if (q > json && q[-1] == ',') {
+            remove_start = q - 1;
+        }
+    }
+
+    size_t removed = (size_t)(remove_end - remove_start);
+    memmove(remove_start, remove_end, (size_t)(end - remove_end) + 1);
+    *json_len -= removed;
+    return removed;
+}
+
+static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streaming) {
     int64_t t_map_start = esp_timer_get_time();
 
     /* Build MapRequest JSON */
@@ -1452,10 +1815,14 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
     cJSON_AddStringToObject(root, "DiscoKey", key_str);
 
-    /* Stream=false for initial fetch */
-    cJSON_AddBoolToObject(root, "Stream", false);
+    /* Modern Headscale serves the full netmap on the streaming map session.
+     * Tailscale SaaS keeps the existing one-shot Stream=false path. */
+    cJSON_AddBoolToObject(root, "Stream", streaming);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
+    if (streaming) {
+        cJSON_AddBoolToObject(root, "OmitPeers", false);
+    }
 
     /* Hostinfo */
     cJSON *hostinfo = cJSON_CreateObject();
@@ -1464,6 +1831,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+    add_routable_ips_to_hostinfo(ml, hostinfo);
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
     /* NetInfo: tell control plane our preferred DERP region and NAT type.
@@ -1478,8 +1846,8 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
     }
 
-    /* Include endpoints if STUN has already completed (Stream=false →
-     * control plane processes these, unlike Stream=true with Version >= 68) */
+    /* Stream=true ignores endpoint updates on modern control planes, but
+     * including the local endpoint is harmless. A lite update is sent later. */
     add_endpoints_to_json(ml, root);
 
     char *json_str = cJSON_PrintUnformatted(root);
@@ -1487,9 +1855,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     if (!json_str) return -1;
 
     size_t json_len = strlen(json_str);
-    ESP_LOGI(TAG, "MapRequest: %d bytes (Stream=false)", (int)json_len);
+    uint32_t map_stream_id = streaming ? 5 : 3;
+    ESP_LOGI(TAG, "MapRequest: %d bytes (Stream=%s, stream=%lu)",
+             (int)json_len, streaming ? "true" : "false",
+             (unsigned long)map_stream_id);
 
-    /* Build H2 HEADERS + DATA, stream ID 3 (stream 1 was register) */
+    /* Register uses stream 1. One-shot fetch uses stream 3; Headscale's
+     * initial streaming map uses stream 5 and remains open for updates. */
     uint8_t *h2_buf = ml_psram_malloc(json_len + 512);
     if (!h2_buf) { free(json_str); return -1; }
 
@@ -1498,13 +1870,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int hdr_len = ml_h2_build_headers_frame(h2_buf + h2_pos, json_len + 512,
                                               "POST", "/machine/map",
                                               CTRL_HOST(ml), "application/json",
-                                              3, false);
+                                              map_stream_id, false);
     if (hdr_len < 0) { free(json_str); free(h2_buf); return -1; }
     h2_pos += hdr_len;
 
     int data_len = ml_h2_build_data_frame(h2_buf + h2_pos, json_len + 512 - h2_pos,
                                             (uint8_t *)json_str, json_len,
-                                            3, true);
+                                            map_stream_id, true);
     free(json_str);
     if (data_len < 0) { free(h2_buf); return -1; }
     h2_pos += data_len;
@@ -1527,15 +1899,27 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * once all frames are accumulated, DATA payloads are extracted in place via
      * memmove() (see below) instead of copying into a second buffer, halving
      * peak footprint. Sized to the runtime window choose_h2_rx_window_size()
-     * picked for this connect cycle (<= ML_H2_BUFFER_SIZE). Ported from
-     * djorr5/microlink's `67b230b2` piece (a); adapted to keep the per-iteration
-     * frame_buf scratch read (below) instead of reading straight into h2_recv --
-     * this fork's noise_recv() returns -1 without draining the ciphertext off
-     * the socket when the frame doesn't fit the caller's buffer, which would
-     * desync the stream if the destination window shrinks near the tail end. */
-    uint32_t h2_window = ml->h2_rx_window_size ? ml->h2_rx_window_size : ML_H2_BUFFER_SIZE;
+     * picked for this connect cycle (<= ML_H2_BUFFER_SIZE). On classic ESP32
+     * without PSRAM we receive directly into the remaining tail of this buffer;
+     * if a response cannot fit, this connection is discarded and retried rather
+     * than allocating a second 64KB scratch buffer. */
+    uint32_t h2_window =
+        ml->h2_rx_window_size ? ml->h2_rx_window_size : ML_H2_BUFFER_SIZE;
+    if (h2_window < 16 * 1024) {
+        ESP_LOGE(TAG, "Not enough contiguous heap for MapResponse buffer: %luKB",
+                 (unsigned long)(h2_window / 1024));
+        return -1;
+    }
+
     uint8_t *h2_recv = ml_psram_malloc(h2_window);
-    if (!h2_recv) return -1;
+    if (!h2_recv) {
+        ESP_LOGE(TAG,
+                 "Failed to allocate %luKB MapResponse buffer (largest=%luKB total=%luKB)",
+                 (unsigned long)(h2_window / 1024),
+                 (unsigned long)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+                 (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+        return -1;
+    }
     size_t h2_total = 0;
     size_t json_total = 0;
 
@@ -1547,60 +1931,97 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     uint64_t last_progress_ms = recv_start_ms;
     size_t window_consumed = 0;
 
-    /* Read all Noise frames and accumulate decrypted H2 data.
-     * Scan for H2 END_STREAM flag (0x01) on DATA frames to know when the
-     * response is complete — without this, we wait for the full recv timeout
-     * (60s) before proceeding, which dominates connection time on cellular. */
+    /* Receive directly into the H2 accumulation buffer. The old code
+     * allocated a second 64KB plaintext scratch buffer while holding this
+     * 64KB buffer. That cannot fit reliably on classic ESP32 without PSRAM
+     * (the WROOM test device had a 92KB largest free block), so the second
+     * allocation failed immediately and produced a misleading 0-byte
+     * MapResponse.
+     *
+     * For Stream=false, completion is END_STREAM. For Headscale's Stream=true
+     * session, the stream intentionally stays open; each map message starts
+     * with a 4-byte little-endian JSON length, so stop once the first complete
+     * message has arrived. */
     bool got_end_stream = false;
+    bool got_initial_message = false;
+    size_t stream_data_total = 0;
+    size_t expected_stream_bytes = 0;
+
     for (int read_count = 0; read_count < 200; read_count++) {
-        uint8_t *frame_buf = ml_psram_malloc(65536);
-        if (!frame_buf) break;
+        if (h2_total + 1 >= h2_window) {
+            ESP_LOGW(TAG, "H2 buffer full at %dKB before MapResponse completed",
+                     (int)(h2_total / 1024));
+            break;
+        }
 
-        int frame_len = noise_recv(ml, noise, frame_buf, 65536);
+        size_t room = h2_window - h2_total - 1; /* keep one byte for JSON NUL */
+        int frame_len = noise_recv(ml, noise, h2_recv + h2_total, room);
         if (frame_len <= 0) {
-            free(frame_buf);
             break;
         }
 
-        /* Append decrypted data to h2_recv */
-        if (h2_total + frame_len < h2_window) {
-            memcpy(h2_recv + h2_total, frame_buf, frame_len);
-            h2_total += frame_len;
-            window_consumed += frame_len;
-        } else {
-            ESP_LOGW(TAG, "H2 buffer full at %dKB, truncating", (int)(h2_total / 1024));
-            free(frame_buf);
-            break;
-        }
-        free(frame_buf);
+        h2_total += (size_t)frame_len;
+        window_consumed += (size_t)frame_len;
 
-        /* Scan newly accumulated data for H2 END_STREAM flag.
-         * H2 frame header: 3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream ID.
-         * DATA frame type=0x00, END_STREAM flag=0x01.
-         * We scan from the start each time since frames may span Noise boundaries. */
+        /* Re-scan complete H2 frames. This is cheap at <=64KB and correctly
+         * handles H2 frames split across Noise transport records. */
         size_t scan_pos = 0;
+        stream_data_total = 0;
+        uint8_t prefix[4] = {0};
+        size_t prefix_have = 0;
+
         while (scan_pos + 9 <= h2_total) {
-            uint32_t f_len = (h2_recv[scan_pos] << 16) | (h2_recv[scan_pos + 1] << 8) | h2_recv[scan_pos + 2];
+            uint32_t f_len = (h2_recv[scan_pos] << 16) |
+                             (h2_recv[scan_pos + 1] << 8) |
+                              h2_recv[scan_pos + 2];
             uint8_t f_type = h2_recv[scan_pos + 3];
             uint8_t f_flags = h2_recv[scan_pos + 4];
+            uint32_t f_stream = ((h2_recv[scan_pos + 5] & 0x7F) << 24) |
+                                (h2_recv[scan_pos + 6] << 16) |
+                                (h2_recv[scan_pos + 7] << 8) |
+                                 h2_recv[scan_pos + 8];
 
-            if (scan_pos + 9 + f_len > h2_total) break;  /* Incomplete frame */
+            if (scan_pos + 9 + f_len > h2_total) break;
 
-            if (f_type == 0x00 && (f_flags & 0x01)) {
-                /* DATA frame with END_STREAM — response is complete */
-                got_end_stream = true;
+            const uint8_t *payload = h2_recv + scan_pos + 9;
+            if (f_type == 0x00 && f_stream == map_stream_id) {
+                if (prefix_have < sizeof(prefix) && f_len > 0) {
+                    size_t take = sizeof(prefix) - prefix_have;
+                    if (take > f_len) take = f_len;
+                    memcpy(prefix + prefix_have, payload, take);
+                    prefix_have += take;
+                }
+                stream_data_total += f_len;
+
+                if (!streaming && (f_flags & 0x01)) {
+                    got_end_stream = true;
+                }
             }
             scan_pos += 9 + f_len;
         }
 
-        if (got_end_stream) {
-            ESP_LOGI(TAG, "H2 END_STREAM detected after %d Noise frames (%dKB, %lums)",
+        if (streaming && prefix_have == 4) {
+            uint32_t msg_len = (uint32_t)prefix[0] |
+                               ((uint32_t)prefix[1] << 8) |
+                               ((uint32_t)prefix[2] << 16) |
+                               ((uint32_t)prefix[3] << 24);
+            if (msg_len > 0 && msg_len < h2_window) {
+                expected_stream_bytes = (size_t)msg_len + 4;
+                if (stream_data_total >= expected_stream_bytes) {
+                    got_initial_message = true;
+                }
+            }
+        }
+
+        if ((!streaming && got_end_stream) ||
+            (streaming && got_initial_message)) {
+            ESP_LOGI(TAG,
+                     "Initial MapResponse complete after %d Noise frames (%dKB, %lums)",
                      read_count + 1, (int)(h2_total / 1024),
                      (unsigned long)(ml_get_time_ms() - recv_start_ms));
             break;
         }
 
-        /* Progress logging every 5 seconds for large responses */
         uint64_t now = ml_get_time_ms();
         if (now - last_progress_ms > 5000) {
             ESP_LOGI(TAG, "MapResponse: received %dKB so far (%d frames, %lums elapsed)",
@@ -1609,18 +2030,26 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             last_progress_ms = now;
         }
 
-        /* Proactive WINDOW_UPDATE every 32KB to keep server sending.
-         * Must update BOTH connection-level (stream 0) AND stream-level (stream 3)
-         * windows, otherwise the server stalls when either window exhausts. */
+        /* Replenish both connection and active map-stream windows. */
         if (window_consumed >= 32768) {
-            uint8_t wu_buf[26];  /* 2 WINDOW_UPDATE frames: 13 bytes each */
-            int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)window_consumed);
-            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 3, (uint32_t)window_consumed);
+            uint8_t wu_buf[26];
+            int wu_len = ml_h2_build_window_update(wu_buf, 13, 0,
+                                                    (uint32_t)window_consumed);
+            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13,
+                                                 map_stream_id,
+                                                 (uint32_t)window_consumed);
             if (wu_len > 0) {
                 noise_send(ml, noise, wu_buf, wu_len);
             }
             window_consumed = 0;
         }
+    }
+
+    if (streaming && !got_initial_message) {
+        ESP_LOGW(TAG,
+                 "Streaming initial MapResponse incomplete (H2=%dKB DATA=%d bytes expected=%d)",
+                 (int)(h2_total / 1024), (int)stream_data_total,
+                 (int)expected_stream_bytes);
     }
 
     /* Restore normal recv timeout (5 seconds for long-poll) */
@@ -1654,7 +2083,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             break;
         }
 
-        if (f_type == 0x00 && f_len > 0) {  /* DATA frame */
+        if (f_type == 0x00 && f_len > 0 && f_stream == map_stream_id) {
             memmove(h2_recv + json_total, h2_recv + fpos, f_len);
             json_total += f_len;
         }
@@ -1662,14 +2091,20 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         fpos += f_len;
     }
 
-    /* Send connection-level WINDOW_UPDATE to replenish HTTP/2 flow control.
-     * Stream 3 is already closed (END_STREAM received), so only update stream 0.
-     * Without this, the server's connection-level window exhausts on large responses. */
+    /* Replenish flow control. A streaming Headscale map keeps stream 5
+     * open, so replenish both connection and stream windows. */
     if (json_total > 0) {
-        uint8_t wu_buf[13];
-        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)json_total);
+        uint8_t wu_buf[26];
+        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0,
+                                                (uint32_t)json_total);
+        if (streaming) {
+            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13,
+                                                 map_stream_id,
+                                                 (uint32_t)json_total);
+        }
         noise_send(ml, noise, wu_buf, wu_len);
-        ESP_LOGI(TAG, "Sent H2 WINDOW_UPDATE: %d bytes (connection level)", (int)json_total);
+        ESP_LOGI(TAG, "Sent H2 WINDOW_UPDATE: %d bytes%s",
+                 (int)json_total, streaming ? " (connection + map stream)" : "");
     }
 
     if (json_total == 0) {
@@ -1691,39 +2126,127 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGI(TAG, "MapResponse first %d bytes (hex): %s", dump, hexbuf);
     }
 
-    /* Check for length prefix (Tailscale binary framing: 4-byte big-endian length before JSON) */
+    /* Map stream messages are length-prefixed. Headscale writes a 4-byte
+     * little-endian length. For the one-shot Tailscale response, preserve the
+     * existing prefix discovery fallback. */
     char *parse_start = (char *)h2_recv;
     size_t parse_len = json_total;
+    bool stream_prefix_applied = false;
 
-    /* Find the start of JSON - look for '{' in first 8 bytes */
-    int json_offset = -1;
-    for (int i = 0; i < 8 && i < (int)json_total; i++) {
-        if (h2_recv[i] == '{') {
-            json_offset = i;
-            break;
+    if (streaming && json_total >= 4) {
+        uint32_t msg_len = (uint32_t)h2_recv[0] |
+                           ((uint32_t)h2_recv[1] << 8) |
+                           ((uint32_t)h2_recv[2] << 16) |
+                           ((uint32_t)h2_recv[3] << 24);
+        if (msg_len > 0 && (size_t)msg_len + 4 <= json_total) {
+            parse_start += 4;
+            parse_len = msg_len;
+            stream_prefix_applied = true;
         }
     }
-    if (json_offset > 0) {
-        ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)", json_offset, json_offset);
-        parse_start += json_offset;
-        parse_len -= json_offset;
-    } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
+
+    /* One-shot responses historically had either a 4-byte prefix or raw JSON.
+     * Only use heuristic prefix discovery when the streaming length prefix was
+     * not already consumed above. */
+    if (!stream_prefix_applied) {
+        int json_offset = -1;
+        for (int i = 0; i < 8 && i < (int)json_total; i++) {
+            if (h2_recv[i] == '{') {
+                json_offset = i;
+                break;
+            }
+        }
+        if (json_offset > 0) {
+            ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)",
+                     json_offset, json_offset);
+            parse_start += json_offset;
+            parse_len -= json_offset;
+        } else if (json_offset < 0) {
+            ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
+        }
     }
 
-    /* Null-terminate */
-    char saved = parse_start[parse_len];
-    parse_start[parse_len] = '\0';
+    /* cJSON allocates a tree while parsing. On classic ESP32 without PSRAM we
+     * must not allocate a second ~20KB JSON buffer while the H2 receive window
+     * is still alive: after DERP/WireGuard have been running for a while the
+     * heap can have plenty of free bytes overall but no second contiguous block
+     * large enough for the copy.
+     *
+     * DATA payloads were already compacted into h2_recv. Move the selected JSON
+     * body (normally past the 4-byte streaming length prefix) to offset zero,
+     * NUL-terminate it, then shrink the existing allocation in place. Shrinking
+     * releases the unused tail without requiring another parse_len-sized block. */
+    if (parse_start != (char *)h2_recv) {
+        memmove(h2_recv, parse_start, parse_len);
+    }
+    h2_recv[parse_len] = '\0';
 
-    cJSON *map_json = cJSON_Parse(parse_start);
-    parse_start[parse_len] = saved;
+    /* The full DERPMap dominates cJSON's allocation cost. Do not rely on
+     * MALLOC_CAP_SPIRAM total size to decide whether we can afford it: some
+     * ESP-IDF configurations expose a non-zero SPIRAM-capable heap even when
+     * the allocations cJSON actually gets are still constrained/fragmented.
+     *
+     * Decide from the heap that cJSON will use right now. A ~20KB netmap with
+     * less than 48KB largest-block or 96KB total free has repeatedly failed
+     * while building the DERPMap tree on ESP32. Node + Peers are essential;
+     * DERP/STUN have compiled fallbacks, so strip only DERPMap under pressure. */
+    size_t parse_largest_free =
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t parse_total_free =
+        heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    bool low_parse_heap =
+        (parse_largest_free < (48 * 1024)) ||
+        (parse_total_free < (96 * 1024));
+
+    if (low_parse_heap) {
+        size_t before = parse_len;
+        size_t removed =
+            strip_json_object_field_in_place((char *)h2_recv, &parse_len, "DERPMap");
+        if (removed > 0) {
+            ESP_LOGI(TAG,
+                     "Low-memory parse: stripped DERPMap (%dKB -> %dKB, largest=%dKB free=%dKB)",
+                     (int)(before / 1024),
+                     (int)(parse_len / 1024),
+                     (int)(parse_largest_free / 1024),
+                     (int)(parse_total_free / 1024));
+        } else {
+            ESP_LOGW(TAG,
+                     "Low-memory parse detected but DERPMap could not be stripped (largest=%dKB free=%dKB)",
+                     (int)(parse_largest_free / 1024),
+                     (int)(parse_total_free / 1024));
+        }
+    }
+    h2_recv[parse_len] = '\0';
+
+    uint8_t *shrunk = heap_caps_realloc(h2_recv, parse_len + 1, MALLOC_CAP_8BIT);
+    if (shrunk) {
+        h2_recv = shrunk;
+    } else {
+        /* A shrink should normally succeed in place. If the allocator refuses
+         * it, the original pointer remains valid; parsing from it is still safer
+         * than failing the control-plane connection immediately. */
+        ESP_LOGW(TAG,
+                 "Could not shrink MapResponse buffer from %lu to %lu bytes; parsing in-place",
+                 (unsigned long)h2_window, (unsigned long)(parse_len + 1));
+    }
+
+    char *json_buf = (char *)h2_recv;
+
+    ESP_LOGI(TAG,
+             "MapResponse compacted in-place (json=%dKB largest_free=%dKB total_free=%dKB)",
+             (int)(parse_len / 1024),
+             (int)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+             (int)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+
+    cJSON *map_json = cJSON_Parse(json_buf);
 
     if (!map_json) {
         const char *err = cJSON_GetErrorPtr();
         ESP_LOGE(TAG, "MapResponse JSON parse failed near: %.50s", err ? err : "unknown");
-        free(h2_recv);
+        free(json_buf);
         return -1;
     }
+    free(json_buf);
 
     /* Debug: log all top-level fields in MapResponse (from v1 lines 3053-3072) */
     {
@@ -1919,7 +2442,6 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     cJSON_Delete(map_json);
-    free(h2_recv);
 
     int64_t t_map_done = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %lld ms (total map: %lld ms, %dKB)",
@@ -1959,6 +2481,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+        add_routable_ips_to_hostinfo(ml, hostinfo);
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
 
@@ -2064,6 +2587,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+        add_routable_ips_to_hostinfo(ml, hostinfo);
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
         cJSON *netinfo = cJSON_CreateObject();
@@ -2129,13 +2653,19 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* Try to read one incremental MapResponse update (non-blocking) */
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
-    /* Use select() to check if data is available before blocking in recv */
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(ml->coord_sock, &readfds);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
-    int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
-    if (sel <= 0) return 0;  /* No data available or error */
+#ifdef CONFIG_ML_CTRL_TLS
+    /* TLS may already have decrypted bytes buffered even when select() says
+     * the underlying socket has nothing readable. */
+    if (!ctrl_tls_enabled(ml) || ml_coord_tls_pending(ml) == 0)
+#endif
+    {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(ml->coord_sock, &readfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
+        int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
+        if (sel <= 0) return 0;  /* No data available or error */
+    }
 
     /* Data available — set short recv timeout for partial frame safety */
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
@@ -2314,8 +2844,7 @@ void ml_coord_task(void *arg) {
                 break;
             case ML_CMD_DISCONNECT:
                 if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
+                    coord_close_conn(ml);
                 }
                 state = COORD_IDLE;
                 ml->state = ML_STATE_IDLE;
@@ -2380,8 +2909,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2396,8 +2924,7 @@ void ml_coord_task(void *arg) {
         case COORD_H2_PREFACE:
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2421,8 +2948,7 @@ void ml_coord_task(void *arg) {
                         }
                         reconnect_attempts = 5;
                     }
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
+                    coord_close_conn(ml);
                     state = COORD_RECONNECTING;
                     break;
                 }
@@ -2430,12 +2956,13 @@ void ml_coord_task(void *arg) {
             state = COORD_FETCH_PEERS;
             break;
 
-        case COORD_FETCH_PEERS:
-            ESP_LOGI(TAG, "Fetching peers...");
-            if (do_fetch_peers(ml, &noise) < 0) {
+        case COORD_FETCH_PEERS: {
+            bool streaming_map = strcmp(CTRL_HOST(ml), "controlplane.tailscale.com") != 0;
+            ESP_LOGI(TAG, "Fetching peers%s...",
+                     streaming_map ? " via streaming Headscale netmap" : "");
+            if (do_fetch_peers(ml, &noise, streaming_map) < 0) {
                 ESP_LOGW(TAG, "MapRequest failed, will retry");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2455,8 +2982,9 @@ void ml_coord_task(void *arg) {
                                     pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
             }
 
-            /* Start streaming long-poll for incremental updates */
-            if (do_start_long_poll(ml, &noise) < 0) {
+            /* Headscale already has stream 5 open from the initial netmap.
+             * Tailscale's one-shot path still needs a separate long-poll. */
+            if (!streaming_map && do_start_long_poll(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "Failed to start long-poll (non-fatal)");
             }
 
@@ -2489,6 +3017,7 @@ void ml_coord_task(void *arg) {
                 ml->state_cb(ml, ML_STATE_CONNECTED, ml->state_cb_data);
             }
             break;
+        }
 
         case COORD_LONG_POLL:
             {
@@ -2775,8 +3304,7 @@ void ml_coord_task(void *arg) {
 
                 /* Close old connection */
                 if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
+                    coord_close_conn(ml);
                 }
 
                 /* Reset Noise state for fresh handshake */
@@ -2790,9 +3318,8 @@ void ml_coord_task(void *arg) {
 
     /* Cleanup */
     if (ml->coord_sock >= 0) {
-        ml_close_sock(ml->coord_sock);
-        ml->coord_sock = -1;
-    }
+                    coord_close_conn(ml);
+                }
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
