@@ -301,7 +301,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
     const bool tailscale_ok = ml && microlink_is_connected(ml);
     const bool healthy = wd_state == WD_NORMAL && wifi_ok;
 
-    char html[2048];
+    static char html[2560];
     int n = snprintf(
         html, sizeof(html),
         "<!doctype html><html><head>"
