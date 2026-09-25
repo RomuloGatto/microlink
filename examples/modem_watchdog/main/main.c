@@ -994,7 +994,7 @@ static void start_http_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 4096;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
 
     ESP_ERROR_CHECK(httpd_start(&http_server, &config));
 
@@ -1013,10 +1013,28 @@ static void start_http_server(void) {
         .method = HTTP_POST,
         .handler = reboot_handler,
     };
+    const httpd_uri_t settings = {
+        .uri = "/settings",
+        .method = HTTP_GET,
+        .handler = settings_page_handler,
+    };
+    const httpd_uri_t settings_get = {
+        .uri = "/api/settings",
+        .method = HTTP_GET,
+        .handler = settings_api_get_handler,
+    };
+    const httpd_uri_t settings_post = {
+        .uri = "/api/settings",
+        .method = HTTP_POST,
+        .handler = settings_api_post_handler,
+    };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &health));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &reboot));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings_post));
 
     ESP_LOGI(TAG, "Watchdog HTTP UI listening on port 80");
 }
