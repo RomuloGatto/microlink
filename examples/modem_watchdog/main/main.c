@@ -25,6 +25,9 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -208,6 +211,7 @@ static char local_ip[16] = "";
 
 static microlink_t *ml = NULL;
 static httpd_handle_t http_server = NULL;
+static volatile bool ota_in_progress = false;
 
 static inline uint64_t now_ms(void) {
     return (uint64_t)(esp_timer_get_time() / 1000);
@@ -402,7 +406,9 @@ static void watchdog_task(void *arg) {
 
         update_reboot_state(now);
 
-        if (wd_state == WD_NORMAL && now - last_internet_check_ms >= cfg_check_interval_ms()) {
+        if (!ota_in_progress &&
+            wd_state == WD_NORMAL &&
+            now - last_internet_check_ms >= cfg_check_interval_ms()) {
             last_internet_check_ms = now;
             refresh_reboot_window(now);
 
@@ -512,6 +518,53 @@ static void delayed_restart_task(void *arg) {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1500));
     esp_restart();
+}
+
+static void ota_validation_task(void *arg) {
+    (void)arg;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (esp_ota_get_state_partition(running, &state) != ESP_OK ||
+        state != ESP_OTA_IMG_PENDING_VERIFY) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "OTA image %s is pending verification; waiting for Wi-Fi + MicroLink",
+             running->label);
+
+    const uint64_t deadline = now_ms() + 180000ULL;
+    while (now_ms() < deadline) {
+        bool wifi_ok =
+            (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+        bool tailscale_ok = ml && microlink_is_connected(ml);
+
+        if (wifi_ok && tailscale_ok) {
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "OTA image verified and marked valid");
+            } else {
+                ESP_LOGE(TAG, "Failed to mark OTA image valid: %s",
+                         esp_err_to_name(err));
+            }
+            vTaskDelete(NULL);
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGE(TAG,
+             "OTA image did not recover Wi-Fi + MicroLink in 180s; rolling back");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    vTaskDelete(NULL);
 }
 
 static esp_err_t settings_api_get_handler(httpd_req_t *req) {
@@ -996,11 +1049,21 @@ static esp_err_t health_handler(httpd_req_t *req) {
         }
     }
 
-    char json[800];
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    bool ota_pending_verify =
+        running_partition &&
+        esp_ota_get_state_partition(running_partition, &ota_state) == ESP_OK &&
+        ota_state == ESP_OTA_IMG_PENDING_VERIFY;
+
+    char json[1024];
     int n = snprintf(
         json, sizeof(json),
         "{\"state\":\"%s\",\"state_label\":\"%s\","
         "\"state_remaining_s\":%u,"
+        "\"firmware_version\":\"%s\",\"ota_slot\":\"%s\","
+        "\"ota_pending_verify\":%s,\"ota_in_progress\":%s,"
         "\"wifi\":%s,\"tailscale_connected\":%s,"
         "\"local_ip\":\"%s\",\"tailscale_ip\":\"%s\","
         "\"failures\":%d,\"failures_limit\":%u,"
@@ -1011,6 +1074,10 @@ static esp_err_t health_handler(httpd_req_t *req) {
         watchdog_state_name(wd_state),
         watchdog_state_label(wd_state),
         (unsigned)state_remaining_s,
+        app_desc ? app_desc->version : "unknown",
+        running_partition ? running_partition->label : "unknown",
+        ota_pending_verify ? "true" : "false",
+        ota_in_progress ? "true" : "false",
         wifi_ok ? "true" : "false",
         tailscale_ok ? "true" : "false",
         local_ip,
@@ -1037,6 +1104,10 @@ static esp_err_t health_handler(httpd_req_t *req) {
 
 static esp_err_t reboot_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Connection", "close");
+    if (ota_in_progress) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "Firmware update in progress.\n");
+    }
     if (wd_state != WD_NORMAL) {
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_sendstr(req, "Modem reboot already in progress.\n");
@@ -1048,6 +1119,121 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
              "Reboot requested. Power will be cut for %u seconds.\n",
              (unsigned)app_cfg.modem_off_s);
     return httpd_resp_sendstr(req, msg);
+}
+
+static esp_err_t ota_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    if (ota_in_progress) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "OTA update already in progress.\n");
+    }
+
+    if (req->content_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Firmware body is empty.\n");
+    }
+
+    const esp_partition_t *update_partition =
+        esp_ota_get_next_update_partition(NULL);
+    if (!update_partition) {
+        ESP_LOGE(TAG, "No OTA update partition available");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "No OTA partition available.\n");
+    }
+
+    if ((size_t)req->content_len > update_partition->size) {
+        ESP_LOGE(TAG, "OTA image too large: %d > %u",
+                 req->content_len, (unsigned)update_partition->size);
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return httpd_resp_sendstr(req, "Firmware image does not fit OTA slot.\n");
+    }
+
+    ESP_LOGW(TAG, "OTA upload starting: %d bytes -> %s",
+             req->content_len, update_partition->label);
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err =
+        esp_ota_begin(update_partition, (size_t)req->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Unable to start OTA write.\n");
+    }
+
+    ota_in_progress = true;
+
+    uint8_t *buf = malloc(1024);
+    if (!buf) {
+        esp_ota_abort(ota_handle);
+        ota_in_progress = false;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Not enough memory for OTA buffer.\n");
+    }
+
+    int remaining = req->content_len;
+    size_t written = 0;
+
+    while (remaining > 0) {
+        int want = remaining > 1024 ? 1024 : remaining;
+        int got = httpd_req_recv(req, (char *)buf, want);
+
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (got <= 0) {
+            ESP_LOGE(TAG, "OTA receive failed after %u bytes", (unsigned)written);
+            free(buf);
+            esp_ota_abort(ota_handle);
+            ota_in_progress = false;
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_sendstr(req, "OTA upload interrupted.\n");
+        }
+
+        err = esp_ota_write(ota_handle, buf, (size_t)got);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed after %u bytes: %s",
+                     (unsigned)written, esp_err_to_name(err));
+            free(buf);
+            esp_ota_abort(ota_handle);
+            ota_in_progress = false;
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_sendstr(req, "Unable to write firmware.\n");
+        }
+
+        written += (size_t)got;
+        remaining -= got;
+    }
+
+    free(buf);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        ota_in_progress = false;
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Firmware image validation failed.\n");
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to select OTA partition %s: %s",
+                 update_partition->label, esp_err_to_name(err));
+        ota_in_progress = false;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Unable to activate firmware.\n");
+    }
+
+    ESP_LOGW(TAG, "OTA upload complete: %u bytes; rebooting into %s",
+             (unsigned)written, update_partition->label);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t send_ret =
+        httpd_resp_sendstr(req, "{\"ok\":true,\"restarting\":true}");
+
+    xTaskCreate(delayed_restart_task, "ota_restart", 2048, NULL, 5, NULL);
+    return send_ret;
 }
 
 static void start_http_server(void) {
@@ -1113,6 +1299,11 @@ static void start_http_server(void) {
         .method = HTTP_POST,
         .handler = reboot_handler,
     };
+    const httpd_uri_t ota_api = {
+        .uri = "/api/ota",
+        .method = HTTP_POST,
+        .handler = ota_handler,
+    };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &health));
@@ -1123,6 +1314,7 @@ static void start_http_server(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &reboot_api));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &ota_api));
 
     ESP_LOGI(TAG, "Watchdog HTTP UI listening on port 80");
 }
@@ -1409,5 +1601,9 @@ void app_main(void) {
 
     ok = xTaskCreate(
         microlink_task, "microlink_boot", 8192, NULL, 5, NULL);
+    ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+
+    ok = xTaskCreate(
+        ota_validation_task, "ota_validate", 3072, NULL, 4, NULL);
     ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
