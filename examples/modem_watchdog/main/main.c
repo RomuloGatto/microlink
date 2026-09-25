@@ -954,7 +954,7 @@ static const char DASHBOARD_HTML[] =
     "<section class='panel'>\n"
     "<div class='panel-head'><div class='panel-icon'><svg><use href='#route'/></svg></div><div><h2>Routing</h2><p class='panel-sub'>Anuncio da rede local</p></div></div>\n"
     "<div class='switch-row'><div><div class='switch-title'>Subnet router</div><div class='switch-desc'>Anuncia a LAN por este ESP.</div></div><label class='switch'><input id='subnet_enabled' type='checkbox'><span></span></label></div>\n"
-    "<div class='field'><label>Advertised subnet</label><input id='subnet_route' class='input' maxlength='23' placeholder='192.168.100.0/24'></div>\n"
+    "<div class='field'><label>Advertised subnet</label><input id='subnet_route' class='input' maxlength='23' placeholder='192.168.0.0/24'></div>\n"
     "</section>\n"
     "<section class='panel'>\n"
     "<div class='panel-head'><div class='panel-icon'><svg><use href='#pulse'/></svg></div><div><h2>Watchdog</h2><p class='panel-sub'>Monitoramento da internet e reinicio do modem</p></div></div>\n"
