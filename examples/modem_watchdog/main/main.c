@@ -949,7 +949,7 @@ static const char DASHBOARD_HTML[] =
     "<div class='panel-head'><div class='panel-icon'><svg><use href='#server'/></svg></div><div><h2>Control plane</h2><p class='panel-sub'>Conexao com o servidor Tailscale (headscale)</p></div></div>\n"
     "<div class='field' style='margin-bottom:clamp(7px,1.1vh,11px)'><label>Hostname</label><input id='ctrl_host' class='input' maxlength='63' required></div>\n"
     "<div class='switch-row'><div><div class='switch-title'>Use TLS</div><div class='switch-desc'>Porta 443 quando ativo; porta 80 quando desativado.</div></div><label class='switch'><input id='ctrl_tls' type='checkbox'><span></span></label></div>\n"
-    "<div class='field'><label>Noise public key</label><input id='noise_pubkey' class='input' maxlength='64' spellcheck='false'><div class='hint'>64 caracteres hexadecimais. Esta chave autentica o control plane.</div></div>\n"
+    "<div class='hint'>A Noise public key e descoberta automaticamente pelo endpoint /key do control plane.</div>\n"
     "</section>\n"
     "<section class='panel'>\n"
     "<div class='panel-head'><div class='panel-icon'><svg><use href='#route'/></svg></div><div><h2>Routing</h2><p class='panel-sub'>Anuncio da rede local</p></div></div>\n"
@@ -1008,7 +1008,7 @@ static const char DASHBOARD_HTML[] =
     "}\n"
     "async function loadSettings(){\n"
     " const r=await fetch('/api/config',{cache:'no-store'});if(!r.ok)throw new Error('settings '+r.status);const j=await r.json();settings=j;\n"
-    " ['wifi_ssid','device_name','ctrl_host','noise_pubkey','subnet_route','priority_peer_ip','check_interval_s','failures_before_reboot','modem_off_s','modem_boot_s','max_auto_reboots','reboot_window_s'].forEach(k=>setv(k,j[k]));\n"
+    " ['wifi_ssid','device_name','ctrl_host','subnet_route','priority_peer_ip','check_interval_s','failures_before_reboot','modem_off_s','modem_boot_s','max_auto_reboots','reboot_window_s'].forEach(k=>setv(k,j[k]));\n"
     " $('ctrl_tls').checked=!!j.ctrl_tls;$('subnet_enabled').checked=!!j.subnet_enabled;$('ctrl_tls').disabled=!j.tls_supported;$('subnet_enabled').disabled=!j.subnet_supported;\n"
     " $('wifi_password').placeholder=j.wifi_password_configured?'Configurada - deixe em branco para manter':'Digite a senha';\n"
     " $('auth_key').placeholder=j.auth_key_configured?'Configurada - deixe em branco para manter':'Digite a auth key';\n"
@@ -1025,7 +1025,7 @@ static const char DASHBOARD_HTML[] =
     "}\n"
     "function payload(){\n"
     " return {wifi_ssid:$('wifi_ssid').value.trim(),wifi_password:$('wifi_password').value,device_name:$('device_name').value.trim(),auth_key:$('auth_key').value.trim(),\n"
-    " ctrl_host:$('ctrl_host').value.trim(),ctrl_tls:$('ctrl_tls').checked,noise_pubkey:$('noise_pubkey').value.trim(),subnet_enabled:$('subnet_enabled').checked,\n"
+    " ctrl_host:$('ctrl_host').value.trim(),ctrl_tls:$('ctrl_tls').checked,noise_pubkey:'',subnet_enabled:$('subnet_enabled').checked,\n"
     " subnet_route:$('subnet_route').value.trim(),priority_peer_ip:$('priority_peer_ip').value.trim(),check_interval_s:Number($('check_interval_s').value),\n"
     " failures_before_reboot:Number($('failures_before_reboot').value),modem_off_s:Number($('modem_off_s').value),modem_boot_s:Number($('modem_boot_s').value),\n"
     " max_auto_reboots:Number($('max_auto_reboots').value),reboot_window_s:Number($('reboot_window_s').value)}\n"
@@ -1634,26 +1634,6 @@ static void wifi_init(void) {
  * MicroLink
  * ========================================================================== */
 
-static int hex_nibble(char ch) {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-    return -1;
-}
-
-static bool decode_noise_key(const char *hex, uint8_t out[32]) {
-    if (!hex || strlen(hex) != 64) return false;
-    for (size_t i = 0; i < 32; i++) {
-        int hi = hex_nibble(hex[i * 2]);
-        int lo = hex_nibble(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return true;
-}
-
-static uint8_t runtime_noise_pubkey[32];
-
 static void on_microlink_state(microlink_t *handle, microlink_state_t state,
                                void *user_data) {
     ESP_LOGI(TAG, "MicroLink state=%d", (int)state);
@@ -1676,17 +1656,6 @@ static void microlink_task(void *arg) {
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
-    const uint8_t *noise_key = NULL;
-    if (app_cfg.noise_pubkey_hex[0]) {
-        if (decode_noise_key(app_cfg.noise_pubkey_hex, runtime_noise_pubkey)) {
-            noise_key = runtime_noise_pubkey;
-        } else {
-            ESP_LOGE(TAG, "Stored Noise public key is invalid; refusing to start MicroLink");
-            vTaskDelete(NULL);
-            return;
-        }
-    }
-
     uint32_t priority_peer = app_cfg.priority_peer_ip[0]
         ? microlink_parse_ip(app_cfg.priority_peer_ip) : 0;
 
@@ -1700,7 +1669,7 @@ static void microlink_task(void *arg) {
         .wifi_tx_power_dbm = 0,
         .priority_peer_ip = priority_peer,
         .ctrl_host = app_cfg.ctrl_host[0] ? app_cfg.ctrl_host : NULL,
-        .ctrl_noise_pubkey = noise_key,
+        .ctrl_noise_pubkey = NULL,  /* custom control planes auto-discover /key */
         .ctrl_tls_override = true,
         .ctrl_tls = app_cfg.ctrl_tls != 0,
 #ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
