@@ -1021,6 +1021,24 @@ static void start_http_server(void) {
         .method = HTTP_POST,
         .handler = settings_api_post_handler,
     };
+    /* Compatibility aliases: the unified dashboard uses /api/settings, while
+     * /api/config and /api/reboot make the app API self-explanatory for
+     * external clients and keep future UI refactors decoupled from the paths. */
+    const httpd_uri_t config_get = {
+        .uri = "/api/config",
+        .method = HTTP_GET,
+        .handler = settings_api_get_handler,
+    };
+    const httpd_uri_t config_post = {
+        .uri = "/api/config",
+        .method = HTTP_POST,
+        .handler = settings_api_post_handler,
+    };
+    const httpd_uri_t reboot_api = {
+        .uri = "/api/reboot",
+        .method = HTTP_POST,
+        .handler = reboot_handler,
+    };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &health));
@@ -1028,6 +1046,9 @@ static void start_http_server(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &settings_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &reboot_api));
 
     ESP_LOGI(TAG, "Watchdog HTTP UI listening on port 80");
 }
