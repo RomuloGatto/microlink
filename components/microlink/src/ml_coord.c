@@ -1618,12 +1618,10 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
      * once all frames are accumulated, DATA payloads are extracted in place via
      * memmove() (see below) instead of copying into a second buffer, halving
      * peak footprint. Sized to the runtime window choose_h2_rx_window_size()
-     * picked for this connect cycle (<= ML_H2_BUFFER_SIZE). Ported from
-     * djorr5/microlink's `67b230b2` piece (a); adapted to keep the per-iteration
-     * frame_buf scratch read (below) instead of reading straight into h2_recv --
-     * this fork's noise_recv() returns -1 without draining the ciphertext off
-     * the socket when the frame doesn't fit the caller's buffer, which would
-     * desync the stream if the destination window shrinks near the tail end. */
+     * picked for this connect cycle (<= ML_H2_BUFFER_SIZE). On classic ESP32
+     * without PSRAM we receive directly into the remaining tail of this buffer;
+     * if a response cannot fit, this connection is discarded and retried rather
+     * than allocating a second 64KB scratch buffer. */
     uint32_t h2_window = ml->h2_rx_window_size ? ml->h2_rx_window_size : ML_H2_BUFFER_SIZE;
     uint8_t *h2_recv = ml_psram_malloc(h2_window);
     if (!h2_recv) return -1;
@@ -1838,6 +1836,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
      * existing prefix discovery fallback. */
     char *parse_start = (char *)h2_recv;
     size_t parse_len = json_total;
+    bool stream_prefix_applied = false;
 
     if (streaming && json_total >= 4) {
         uint32_t msg_len = (uint32_t)h2_recv[0] |
@@ -1847,23 +1846,29 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
         if (msg_len > 0 && (size_t)msg_len + 4 <= json_total) {
             parse_start += 4;
             parse_len = msg_len;
+            stream_prefix_applied = true;
         }
     }
 
-    /* Find the start of JSON - look for '{' in first 8 bytes */
-    int json_offset = -1;
-    for (int i = 0; i < 8 && i < (int)json_total; i++) {
-        if (h2_recv[i] == '{') {
-            json_offset = i;
-            break;
+    /* One-shot responses historically had either a 4-byte prefix or raw JSON.
+     * Only use heuristic prefix discovery when the streaming length prefix was
+     * not already consumed above. */
+    if (!stream_prefix_applied) {
+        int json_offset = -1;
+        for (int i = 0; i < 8 && i < (int)json_total; i++) {
+            if (h2_recv[i] == '{') {
+                json_offset = i;
+                break;
+            }
         }
-    }
-    if (json_offset > 0) {
-        ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)", json_offset, json_offset);
-        parse_start += json_offset;
-        parse_len -= json_offset;
-    } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
+        if (json_offset > 0) {
+            ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)",
+                     json_offset, json_offset);
+            parse_start += json_offset;
+            parse_len -= json_offset;
+        } else if (json_offset < 0) {
+            ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
+        }
     }
 
     /* Null-terminate */
