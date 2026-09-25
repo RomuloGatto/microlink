@@ -368,10 +368,10 @@ static const char *watchdog_state_name(watchdog_state_t state) {
 
 static const char *watchdog_state_label(watchdog_state_t state) {
     switch (state) {
-        case WD_NORMAL:            return "monitorando";
-        case WD_POWER_CUT:         return "fonte desligada";
-        case WD_WAITING_FOR_MODEM: return "modem inicializando";
-        default:                   return "desconhecido";
+        case WD_NORMAL:            return "monitoring";
+        case WD_POWER_CUT:         return "power off";
+        case WD_WAITING_FOR_MODEM: return "modem starting";
+        default:                   return "unknown";
     }
 }
 
