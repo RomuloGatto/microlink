@@ -37,6 +37,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "dns_server.h"
 
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -243,6 +244,9 @@ static httpd_handle_t http_server = NULL;
 static volatile bool ota_in_progress = false;
 static bool rescue_ap_active = false;
 static char rescue_ap_ssid[33] = "";
+static char captive_portal_uri[32] = "";
+static esp_netif_t *rescue_ap_netif = NULL;
+static dns_server_handle_t rescue_dns_server = NULL;
 
 static inline uint64_t now_ms(void) {
     return (uint64_t)(esp_timer_get_time() / 1000);
@@ -892,7 +896,7 @@ static const char DASHBOARD_HTML[] =
     ".toast{position:fixed;right:14px;bottom:14px;z-index:80;max-width:420px;padding:11px 14px;border-radius:11px;background:#0d1a2b;border:1px solid var(--line2);box-shadow:var(--shadow);opacity:0;transform:translateY(10px);pointer-events:none;transition:.18s}.toast.show{opacity:1;transform:none}.toast.error{border-color:#7a3140;color:#ffb3bb}.toast.success{border-color:#27683e;color:#b7f7c8}\n"
     ".overlay{position:fixed;inset:0;background:#020814c7;backdrop-filter:blur(5px);display:none;align-items:center;justify-content:center;padding:20px;z-index:100}.overlay.show{display:flex}.modal{width:min(460px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;border-radius:20px;background:linear-gradient(180deg,#12233a,#0a1727);border:1px solid #294765;box-shadow:0 30px 90px #000b;padding:22px}.modal-top{display:flex;gap:13px;align-items:flex-start}.modal-symbol{width:42px;height:42px;border-radius:13px;background:#f1495515;color:#ff6872;display:grid;place-items:center;flex:0 0 auto}.modal-symbol.blue{background:#438cff15;color:#65a7ff}.modal-symbol svg{width:22px;height:22px}.modal h3{margin:1px 0 5px;font-size:19px}.modal p{margin:0;color:var(--muted);line-height:1.45;font-size:13px}.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}.modal-btn{height:42px;padding:0 16px;border-radius:10px;border:1px solid #31455d;background:#17263a;color:white;font-weight:700}.modal-btn.danger{border:0;background:#ed3f4c}.countdown{display:none;margin-top:18px}.countdown.show{display:block}.count-num{font-size:48px;font-weight:900;letter-spacing:-.04em;text-align:center}.count-label{text-align:center;color:var(--muted);font-size:12px}.progress{height:8px;margin-top:15px;border-radius:99px;background:#ffffff0f;overflow:hidden}.progress>div{height:100%;width:0;background:#438cff;transition:width .9s linear}\n"
     "@media(max-width:1050px){.hero p{display:none}.health-link{display:none}.btn{padding:0 10px}.workspace{grid-template-columns:145px minmax(0,1fr)}.panels{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}\n"
-    "@media(max-width:760px){.brandmark{display:none}.hero h1{font-size:15px}.workspace{grid-template-columns:104px minmax(0,1fr);gap:4px}.stats{padding:3px}.stat{padding:4px 3px;gap:4px}.stat-icon{width:15px;height:15px}.stat-label{font-size:8px}.stat-value{font-size:10px}.panels{gap:4px}.panel{padding:7px}.panel-icon{display:none}.panel h2{font-size:11px}.panel-sub,.hint,.switch-desc{display:none}.field label{font-size:8px}.input{height:28px;font-size:9px;padding:0 6px}.watch-grid,.fields{gap:5px 4px}.btn{font-size:9px;padding:0 7px}.switch{transform:scale(.82);transform-origin:right center}}\n"
+    "@media(max-width:760px){html,body{height:auto;min-height:100%;overflow:auto}body{min-height:100dvh}.app{width:100%;height:auto;min-height:100dvh;padding:12px;display:block;overflow:visible}.hero{display:block;margin-bottom:10px}.brand{margin-bottom:10px}.brandmark{width:34px;height:34px}.hero h1{font-size:20px;white-space:normal}.hero p{display:block;margin-top:4px;font-size:11px;line-height:1.35;white-space:normal}.hero-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.health-link{display:none}.btn{width:100%;height:44px;padding:0 10px;font-size:12px}.btn-primary{grid-column:1/-1}.notice{position:static!important;left:auto!important;right:auto!important;top:auto!important;margin:0 0 10px;padding:10px 12px;font-size:11px;line-height:1.35}.workspace{display:flex;flex-direction:column;gap:10px}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:6px;overflow:visible}.stat,.stat:not(:last-child){min-height:64px;padding:9px 8px;gap:8px;display:flex;align-items:center;flex:none;border:1px solid #1d324a;border-radius:10px}.stat-icon{width:18px;height:18px}.stat-label{font-size:10px;margin-bottom:3px}.stat-value{font-size:12px;line-height:1.25;white-space:normal;overflow:visible;text-overflow:clip}#form{height:auto;min-height:0}.panels{height:auto;display:flex;flex-direction:column;gap:10px}.panel:nth-child(1),.panel:nth-child(2),.panel:nth-child(3),.panel:nth-child(4){grid-column:auto;grid-row:auto}.panel{padding:14px;border-radius:14px;overflow:visible}.panel-head{margin-bottom:12px}.panel-icon{display:grid;width:26px;height:26px}.panel h2{font-size:16px}.panel-sub{display:block;font-size:10px;line-height:1.35}.fields,.watch-grid{grid-template-columns:1fr;gap:10px}.field.full{grid-column:auto}.field label{font-size:12px;margin-bottom:5px}.hint,.switch-desc{display:block;font-size:10px;line-height:1.3}.input{height:44px;font-size:16px;padding:0 11px}.input.has-eye{padding-right:42px}.eye{width:38px;height:38px}.switch{transform:none}.switch-row{margin-bottom:12px}.watch-note{margin-top:10px;padding-top:8px;font-size:10px}.toast{left:12px;right:12px;bottom:12px;max-width:none}.overlay{padding:12px}.modal{width:100%;padding:18px;border-radius:16px}.modal-top{gap:10px}.modal-symbol{width:38px;height:38px}.modal h3{font-size:18px}.modal p{font-size:12px}.modal-actions{gap:8px}.modal-btn{flex:1}.count-num{font-size:42px}}\n"
     "</style>\n"
     "</head>\n"
     "<body>\n"
@@ -1008,7 +1012,7 @@ static const char DASHBOARD_HTML[] =
     " $('ctrl_tls').checked=!!j.ctrl_tls;$('subnet_enabled').checked=!!j.subnet_enabled;$('ctrl_tls').disabled=!j.tls_supported;$('subnet_enabled').disabled=!j.subnet_supported;\n"
     " $('wifi_password').placeholder=j.wifi_password_configured?'Configurada - deixe em branco para manter':'Digite a senha';\n"
     " $('auth_key').placeholder=j.auth_key_configured?'Configurada - deixe em branco para manter':'Digite a auth key';\n"
-    " $('pending').classList.toggle('show',!!j.wifi_pending);$('off_note').textContent=j.modem_off_s||20;baseline=JSON.stringify(payload());$('save').disabled=true\n"
+    " $('off_note').textContent=j.modem_off_s||20;baseline=JSON.stringify(payload());$('save').disabled=true\n"
     "}\n"
     "async function loadHealth(){\n"
     " try{\n"
@@ -1016,7 +1020,7 @@ static const char DASHBOARD_HTML[] =
     "  if(h.rescue_ap_active){$('st_wifi').textContent='configuracao';$('st_local').textContent=h.rescue_ap_ip||'192.168.4.1'}else{$('st_wifi').innerHTML=dot(!!h.wifi,h.wifi?'conectado':'desconectado');$('st_local').textContent=h.local_ip||'-'}$('st_ts').innerHTML=dot(!!h.tailscale_connected,h.tailscale_connected?'conectado':'desconectado');\n"
     "  $('st_ip').textContent=h.tailscale_ip||'-';$('st_fail').textContent=String(h.failures)+' / '+String(h.failures_limit);\n"
     "  $('st_reboots').textContent=String(h.auto_reboots)+' / '+String(h.auto_reboots_limit);stateName=h.state||'';stateLabel=h.state_label||h.state||'-';stateRemaining=Number(h.state_remaining_s||0);stateSyncMs=Date.now();renderState();\n"
-    "  $('pending').classList.toggle('show',!!h.wifi_pending);if(h.modem_off_s)$('off_note').textContent=h.modem_off_s\n"
+    "  const pn=$('pending');if(h.rescue_ap_active){pn.textContent='Modo de configuracao: conecte este ESP a uma rede Wi-Fi e salve as configuracoes.';pn.classList.add('show')}else{pn.textContent='Nova rede Wi-Fi em validacao. Se ela nao conectar, a configuracao anterior sera restaurada automaticamente.';pn.classList.toggle('show',!!h.wifi_pending)}if(h.modem_off_s)$('off_note').textContent=h.modem_off_s\n"
     " }catch(e){}\n"
     "}\n"
     "function payload(){\n"
@@ -1282,6 +1286,25 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     return send_ret;
 }
 
+static esp_err_t captive_portal_404_handler(httpd_req_t *req,
+                                                  httpd_err_code_t error) {
+    (void)error;
+
+    if (!rescue_ap_active) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Not found");
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/plain");
+
+    /* iOS captive-network detection requires a non-empty response body. */
+    return httpd_resp_sendstr(req, "Redirecting to Modem Watchdog setup");
+}
+
 static void start_http_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
@@ -1361,8 +1384,11 @@ static void start_http_server(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &reboot_api));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &ota_api));
+    ESP_ERROR_CHECK(httpd_register_err_handler(
+        http_server, HTTPD_404_NOT_FOUND, captive_portal_404_handler));
 
-    ESP_LOGI(TAG, "Watchdog HTTP UI listening on port 80");
+    ESP_LOGI(TAG, "Watchdog HTTP UI listening on port 80%s",
+             rescue_ap_active ? " (captive portal)" : "");
 }
 
 /* ============================================================================
@@ -1494,6 +1520,45 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+static void start_rescue_captive_portal(void) {
+    if (!rescue_ap_netif) {
+        ESP_LOGE(TAG, "Cannot start captive portal: SoftAP netif is missing");
+        return;
+    }
+
+    snprintf(captive_portal_uri, sizeof(captive_portal_uri),
+             "http://%s", RESCUE_AP_IP);
+
+    /* Advertise RFC 8910 captive-portal URI in DHCP option 114. The URI
+     * storage must remain valid for the lifetime of the DHCP server. */
+    esp_netif_dhcps_stop(rescue_ap_netif);
+    esp_err_t err = esp_netif_dhcps_option(
+        rescue_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+        captive_portal_uri, strlen(captive_portal_uri));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not set DHCP captive portal URI: %s",
+                 esp_err_to_name(err));
+    }
+    err = esp_netif_dhcps_start(rescue_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not restart SoftAP DHCP server: %s",
+                 esp_err_to_name(err));
+    }
+
+    /* Also hijack all A queries to the SoftAP. This covers devices that still
+     * rely on the classic captive-network connectivity probes. */
+    if (!rescue_dns_server) {
+        dns_server_config_t dns_config =
+            DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
+        rescue_dns_server = start_dns_server(&dns_config);
+        if (!rescue_dns_server) {
+            ESP_LOGW(TAG, "Could not start captive DNS redirect");
+        }
+    }
+
+    ESP_LOGI(TAG, "Captive portal advertised at %s", captive_portal_uri);
+}
+
 static void wifi_init(void) {
     wifi_event_group = xEventGroupCreate();
 
@@ -1502,7 +1567,7 @@ static void wifi_init(void) {
 
     const bool needs_provisioning = app_cfg.wifi_ssid[0] == '\0';
     if (needs_provisioning) {
-        esp_netif_create_default_wifi_ap();
+        rescue_ap_netif = esp_netif_create_default_wifi_ap();
     } else {
         esp_netif_create_default_wifi_sta();
     }
@@ -1537,6 +1602,7 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_start());
 
         rescue_ap_active = true;
+        start_rescue_captive_portal();
         ESP_LOGW(TAG,
                  "No WiFi SSID configured; rescue AP started: SSID=%s password=%s IP=%s",
                  rescue_ap_ssid, RESCUE_AP_PASSWORD, RESCUE_AP_IP);
