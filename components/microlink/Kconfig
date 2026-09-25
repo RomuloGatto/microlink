@@ -342,7 +342,7 @@ menu "MicroLink V2 Configuration"
             default ""
             help
                 64-character hex Noise/machine public key from:
-                https://<control-host>/key?v=88
+                https://<control-host>/key?v=131
                 The response field is publicKey="mkey:<hex>"; paste only
                 the hex part here. Empty uses Tailscale's built-in key.
 
