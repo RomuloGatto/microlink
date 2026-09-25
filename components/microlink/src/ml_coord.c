@@ -51,12 +51,25 @@ static volatile bool s_captive_portal = false;
 /* Effective control plane host: NVS/config override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
+static bool ctrl_tls_enabled(const microlink_t *ml) {
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml && ml->config.ctrl_tls_override) {
+        return ml->config.ctrl_tls;
+    }
+    return true;
+#else
+    (void)ml;
+    return false;
+#endif
+}
+
 static int coord_raw_recv(microlink_t *ml, uint8_t *buf, size_t len) {
 #ifdef CONFIG_ML_CTRL_TLS
-    return ml_coord_tls_recv(ml, buf, len);
-#else
-    return ml_recv(ml->coord_sock, buf, len, 0);
+    if (ctrl_tls_enabled(ml)) {
+        return ml_coord_tls_recv(ml, buf, len);
+    }
 #endif
+    return ml_recv(ml->coord_sock, buf, len, 0);
 }
 
 static void coord_close_conn(microlink_t *ml) {
@@ -121,12 +134,14 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
 #ifdef CONFIG_ML_CTRL_TLS
-    if (ml_coord_tls_send(ml, data, len) < 0) {
-        ESP_LOGE(TAG, "coord_send (TLS) failed: len=%d errno=%d", (int)len, errno);
-        return -1;
+    if (ctrl_tls_enabled(ml)) {
+        if (ml_coord_tls_send(ml, data, len) < 0) {
+            ESP_LOGE(TAG, "coord_send (TLS) failed: len=%d errno=%d", (int)len, errno);
+            return -1;
+        }
+        return 0;
     }
-    return 0;
-#else
+#endif
     size_t sent = 0;
     while (sent < len) {
         int n = ml_send(ml->coord_sock, data + sent, len - sent, 0);
@@ -138,7 +153,6 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
         sent += n;
     }
     return 0;
-#endif
 }
 
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
@@ -265,11 +279,7 @@ static int do_tcp_connect(microlink_t *ml) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-#ifdef CONFIG_ML_CTRL_TLS
-    const char *ctrl_port = "443";
-#else
-    const char *ctrl_port = "80";
-#endif
+    const char *ctrl_port = ctrl_tls_enabled(ml) ? "443" : "80";
 
     if (ml_getaddrinfo(CTRL_HOST(ml), ctrl_port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
@@ -318,13 +328,15 @@ static int do_tcp_connect(microlink_t *ml) {
     ml->coord_sock = sock;
 
 #ifdef CONFIG_ML_CTRL_TLS
-    if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
-        coord_close_conn(ml);
-        return -1;
+    if (ctrl_tls_enabled(ml)) {
+        if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
+            coord_close_conn(ml);
+            return -1;
+        }
+        int64_t t_tls = esp_timer_get_time();
+        ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms",
+                 (t_tls - t_tcp) / 1000);
     }
-    int64_t t_tls = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms",
-             (t_tls - t_tcp) / 1000);
 #endif
 
     return 0;
@@ -2359,7 +2371,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 #ifdef CONFIG_ML_CTRL_TLS
     /* TLS may already have decrypted bytes buffered even when select() says
      * the underlying socket has nothing readable. */
-    if (ml_coord_tls_pending(ml) == 0)
+    if (!ctrl_tls_enabled(ml) || ml_coord_tls_pending(ml) == 0)
 #endif
     {
         fd_set readfds;
