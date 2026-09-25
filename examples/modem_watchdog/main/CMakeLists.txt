@@ -9,6 +9,7 @@ idf_component_register(
         esp_event
         esp_http_server
         app_update
+        dns_server
         esp_app_format
         esp_driver_gpio
         espressif__cjson
