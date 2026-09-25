@@ -29,6 +29,8 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "cJSON.h"
 
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -45,13 +47,139 @@ static const char *TAG = "modem_watchdog";
 #define RELAY_MODEM_ON_LEVEL       1
 #define RELAY_MODEM_OFF_LEVEL      0
 
-#define CHECK_INTERVAL_MS          (60ULL * 1000ULL)
-#define FAILURES_BEFORE_REBOOT     5
-#define MODEM_OFF_MS               (20ULL * 1000ULL)
-#define MODEM_BOOT_MS              (5ULL * 60ULL * 1000ULL)
-#define MAX_AUTO_REBOOTS           3
-#define REBOOT_WINDOW_MS           (2ULL * 60ULL * 60ULL * 1000ULL)
-#define TCP_PROBE_TIMEOUT_MS       2500
+#define DEFAULT_CHECK_INTERVAL_S      60U
+#define DEFAULT_FAILURES_BEFORE_REBOOT 5U
+#define DEFAULT_MODEM_OFF_S            20U
+#define DEFAULT_MODEM_BOOT_S           300U
+#define DEFAULT_MAX_AUTO_REBOOTS       3U
+#define DEFAULT_REBOOT_WINDOW_S        7200U
+#define TCP_PROBE_TIMEOUT_MS           2500
+
+#define APP_CONFIG_NAMESPACE           "modem_cfg"
+#define APP_CONFIG_KEY                 "settings"
+#define APP_CONFIG_VERSION             1
+
+typedef struct {
+    uint8_t version;
+
+    char wifi_ssid[33];
+    char wifi_pass[65];
+    char prev_wifi_ssid[33];
+    char prev_wifi_pass[65];
+    uint8_t wifi_pending;
+
+    char auth_key[96];
+    char device_name[48];
+
+    char ctrl_host[64];
+    uint8_t ctrl_tls;
+    char noise_pubkey_hex[65];
+
+    uint8_t subnet_enabled;
+    char subnet_route[24];
+    char priority_peer_ip[16];
+
+    uint32_t check_interval_s;
+    uint8_t failures_before_reboot;
+    uint16_t modem_off_s;
+    uint16_t modem_boot_s;
+    uint8_t max_auto_reboots;
+    uint32_t reboot_window_s;
+} app_settings_t;
+
+static app_settings_t app_cfg;
+
+static void copy_str(char *dst, size_t dst_len, const char *src) {
+    if (!dst || dst_len == 0) return;
+    snprintf(dst, dst_len, "%s", src ? src : "");
+}
+
+static void app_config_defaults(app_settings_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->version = APP_CONFIG_VERSION;
+
+    copy_str(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), CONFIG_ML_WIFI_SSID);
+    copy_str(cfg->wifi_pass, sizeof(cfg->wifi_pass), CONFIG_ML_WIFI_PASSWORD);
+    copy_str(cfg->auth_key, sizeof(cfg->auth_key), CONFIG_ML_TAILSCALE_AUTH_KEY);
+    copy_str(cfg->device_name, sizeof(cfg->device_name), CONFIG_ML_DEVICE_NAME);
+    copy_str(cfg->ctrl_host, sizeof(cfg->ctrl_host), CONFIG_ML_CTRL_HOST);
+#ifdef CONFIG_ML_CTRL_TLS
+    cfg->ctrl_tls = 1;
+#else
+    cfg->ctrl_tls = 0;
+#endif
+#ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+    copy_str(cfg->noise_pubkey_hex, sizeof(cfg->noise_pubkey_hex),
+             CONFIG_ML_CTRL_NOISE_PUBKEY_HEX);
+#endif
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+    cfg->subnet_enabled = CONFIG_ML_SUBNET_ROUTE[0] != '\0';
+    copy_str(cfg->subnet_route, sizeof(cfg->subnet_route), CONFIG_ML_SUBNET_ROUTE);
+#else
+    cfg->subnet_enabled = 0;
+#endif
+#ifdef CONFIG_ML_PRIORITY_PEER_IP
+    copy_str(cfg->priority_peer_ip, sizeof(cfg->priority_peer_ip),
+             CONFIG_ML_PRIORITY_PEER_IP);
+#endif
+
+    cfg->check_interval_s = DEFAULT_CHECK_INTERVAL_S;
+    cfg->failures_before_reboot = DEFAULT_FAILURES_BEFORE_REBOOT;
+    cfg->modem_off_s = DEFAULT_MODEM_OFF_S;
+    cfg->modem_boot_s = DEFAULT_MODEM_BOOT_S;
+    cfg->max_auto_reboots = DEFAULT_MAX_AUTO_REBOOTS;
+    cfg->reboot_window_s = DEFAULT_REBOOT_WINDOW_S;
+}
+
+static esp_err_t app_config_save(void) {
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(APP_CONFIG_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_blob(nvs, APP_CONFIG_KEY, &app_cfg, sizeof(app_cfg));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+static void app_config_load(void) {
+    app_config_defaults(&app_cfg);
+
+    nvs_handle_t nvs;
+    if (nvs_open(APP_CONFIG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(TAG, "No runtime settings yet; using sdkconfig defaults");
+        return;
+    }
+
+    app_settings_t stored = {0};
+    size_t len = sizeof(stored);
+    esp_err_t err = nvs_get_blob(nvs, APP_CONFIG_KEY, &stored, &len);
+    nvs_close(nvs);
+
+    if (err == ESP_OK && len == sizeof(stored) &&
+        stored.version == APP_CONFIG_VERSION) {
+        app_cfg = stored;
+        ESP_LOGI(TAG, "Runtime settings loaded from NVS");
+    } else {
+        ESP_LOGI(TAG, "No compatible runtime settings; using sdkconfig defaults");
+    }
+}
+
+static inline uint64_t cfg_check_interval_ms(void) {
+    return (uint64_t)app_cfg.check_interval_s * 1000ULL;
+}
+
+static inline uint64_t cfg_modem_off_ms(void) {
+    return (uint64_t)app_cfg.modem_off_s * 1000ULL;
+}
+
+static inline uint64_t cfg_modem_boot_ms(void) {
+    return (uint64_t)app_cfg.modem_boot_s * 1000ULL;
+}
+
+static inline uint64_t cfg_reboot_window_ms(void) {
+    return (uint64_t)app_cfg.reboot_window_s * 1000ULL;
+}
 
 typedef enum {
     WD_NORMAL = 0,
