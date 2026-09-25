@@ -21,6 +21,23 @@ Tailscale auth key, and device name.
 Under **MicroLink V2 Configuration > Subnet Router**, set the LAN prefix to
 advertise, for example `192.168.100.0/24`.
 
+For the Novoagatto Headscale deployment, also open **Control Plane** and use:
+
+- hostname: `headscale.novoagatto.com`
+- TLS/443: enabled
+- Noise public key: the 64 hex characters from
+  `https://headscale.novoagatto.com/key?v=88`
+
+On macOS the value can be extracted with:
+
+```bash
+curl -fsSL 'https://headscale.novoagatto.com/key?v=88' \
+  | python3 -c 'import json,sys; print((json.load(sys.stdin).get("publicKey") or json.load(sys.stdin).get("legacyPublicKey")).removeprefix("mkey:"))'
+```
+
+If the one-liner fails because the endpoint response shape differs, print the
+raw JSON and copy the value after `mkey:`.
+
 Then:
 
 ```bash
