@@ -57,6 +57,12 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Optional custom coordination server (Headscale / Ionscale).
+     * NULL/empty host uses CONFIG_ML_CTRL_HOST. A non-NULL Noise key points
+     * to 32 raw bytes and overrides CONFIG_ML_CTRL_NOISE_PUBKEY_HEX. */
+    const char *ctrl_host;
+    const uint8_t *ctrl_noise_pubkey;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
