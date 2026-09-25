@@ -298,38 +298,57 @@ static esp_err_t root_handler(httpd_req_t *req) {
 
     const bool wifi_ok =
         (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+    const bool tailscale_ok = ml && microlink_is_connected(ml);
+    const bool healthy = wd_state == WD_NORMAL && wifi_ok;
 
     char html[2048];
     int n = snprintf(
         html, sizeof(html),
         "<!doctype html><html><head>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv='refresh' content='10'>"
         "<title>Modem Watchdog</title>"
         "<style>"
-        "body{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;"
-        "background:#f4f4f4;margin:0;padding:24px}"
-        ".c{max-width:540px;margin:auto;background:#fff;padding:24px;"
-        "border-radius:16px;box-shadow:0 3px 16px #0001}"
-        ".r{padding:7px 0;border-bottom:1px solid #eee}"
-        "button{width:100%%;margin-top:20px;padding:14px;border:0;"
-        "border-radius:10px;font-size:16px;cursor:pointer}"
+        "*{box-sizing:border-box}body{margin:0;padding:24px;background:#0b0f14;"
+        "color:#eef2f7;font:15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}"
+        ".c{max-width:560px;margin:auto}.h{display:flex;align-items:center;"
+        "justify-content:space-between;margin-bottom:18px}.t{font-size:22px;font-weight:700}"
+        ".b{padding:7px 10px;border-radius:999px;background:%s;color:white;font-size:12px;font-weight:700}"
+        ".p{background:#121821;border:1px solid #202a36;border-radius:18px;padding:18px;"
+        "box-shadow:0 14px 40px #0006}.g{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
+        ".s{background:#0e141c;border:1px solid #1e2936;border-radius:14px;padding:14px}"
+        ".l{color:#8190a3;font-size:12px;margin-bottom:5px}.v{font-size:17px;font-weight:650}"
+        ".dot{display:inline-block;width:8px;height:8px;border-radius:50%%;"
+        "background:%s;margin-right:7px}.a{display:block;margin-top:14px;color:#9fb0c5;"
+        "text-decoration:none;font-size:13px}.btn{width:100%%;margin-top:18px;padding:14px;"
+        "border:0;border-radius:12px;background:#e5484d;color:white;font-size:15px;"
+        "font-weight:700;cursor:pointer}.n{text-align:center;color:#68788b;font-size:12px;margin-top:9px}"
         "</style></head><body><div class='c'>"
-        "<h2>Modem Watchdog</h2>"
-        "<div class='r'><b>State:</b> %s</div>"
-        "<div class='r'><b>WiFi:</b> %s</div>"
-        "<div class='r'><b>Tailscale IP:</b> %s</div>"
-        "<div class='r'><b>Failures:</b> %d/%d</div>"
-        "<div class='r'><b>Auto reboots:</b> %d/%d</div>"
-        "<form method='POST' action='/reboot'>"
-        "<button type='submit'>Reboot modem now</button></form>"
-        "</div></body></html>",
-        watchdog_state_name(wd_state),
-        wifi_ok ? "connected" : "disconnected",
+        "<div class='h'><div class='t'>Modem Watchdog</div><div class='b'>%s</div></div>"
+        "<div class='p'><div class='g'>"
+        "<div class='s'><div class='l'>Wi-Fi</div><div class='v'><span class='dot'></span>%s</div></div>"
+        "<div class='s'><div class='l'>Tailscale</div><div class='v'>%s</div></div>"
+        "<div class='s'><div class='l'>Tailscale IP</div><div class='v'>%s</div></div>"
+        "<div class='s'><div class='l'>Falhas</div><div class='v'>%d / %d</div></div>"
+        "<div class='s'><div class='l'>Reboots auto</div><div class='v'>%d / %d</div></div>"
+        "<div class='s'><div class='l'>Estado</div><div class='v'>%s</div></div>"
+        "</div><a class='a' href='/health'>Ver JSON de health →</a>"
+        "<form method='POST' action='/reboot' onsubmit=\"return confirm('Reiniciar o modem agora?')\">"
+        "<button class='btn' type='submit'>Reiniciar modem</button></form>"
+        "<div class='n'>A energia sera cortada por 20 segundos · atualiza a cada 10s</div>"
+        "</div></div></body></html>",
+        healthy ? "#2f9e44" : "#d9485f",
+        wifi_ok ? "#2f9e44" : "#d9485f",
+        healthy ? "ONLINE" : "ATENCAO",
+        wifi_ok ? "conectado" : "desconectado",
+        tailscale_ok ? "conectado" : "desconectado",
         vpn_ip,
         consecutive_failures, FAILURES_BEFORE_REBOOT,
-        automatic_reboots, MAX_AUTO_REBOOTS);
+        automatic_reboots, MAX_AUTO_REBOOTS,
+        watchdog_state_name(wd_state));
 
-    if (n < 0) {
+    if (n < 0 || n >= (int)sizeof(html)) {
+        ESP_LOGE(TAG, "Watchdog UI HTML overflow (%d bytes)", n);
         return ESP_FAIL;
     }
 
