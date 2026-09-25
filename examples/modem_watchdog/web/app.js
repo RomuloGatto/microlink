@@ -39,7 +39,7 @@ async function loadHealth(){
   if(h.rescue_ap_active){$('st_wifi').textContent='setup';$('st_local').textContent=h.rescue_ap_ip||'192.168.4.1'}else{$('st_wifi').innerHTML=dot(!!h.wifi,h.wifi?'connected':'desconnected');$('st_local').textContent=h.local_ip||'-'}$('st_ts').innerHTML=dot(!!h.tailscale_connected,h.tailscale_connected?'connected':'desconnected');
   $('st_ip').textContent=h.tailscale_ip||'-';$('st_fail').textContent=String(h.failures)+' / '+String(h.failures_limit);
   $('st_reboots').textContent=String(h.auto_reboots)+' / '+String(h.auto_reboots_limit);stateName=h.state||'';stateLabel=h.state_label||h.state||'-';stateRemaining=Number(h.state_remaining_s||0);stateSyncMs=Date.now();renderState();
-  const pn=$('pending');if(h.rescue_ap_active){pn.textContent='Modo de setup: conecte este ESP a uma rede Wi-Fi e salve as configuracoes.';pn.classList.add('show')}else{pn.textContent='Nova rede Wi-Fi em validacao. Se ela nao conectar, a setup anterior sera restaurada automaticamente.';pn.classList.toggle('show',!!h.wifi_pending)}if(h.modem_off_s)$('off_note').textContent=h.modem_off_s
+  const pn=$('pending');if(h.rescue_ap_active){pn.textContent='Setup mode: connect this ESP to a Wi-Fi network and save the settings.';pn.classList.add('show')}else{pn.textContent='New Wi-Fi network is being validated. If it cannot connect, the previous configuration will be restored automatically.';pn.classList.toggle('show',!!h.wifi_pending)}if(h.modem_off_s)$('off_note').textContent=h.modem_off_s
  }catch(e){}
 }
 function payload(){
