@@ -36,7 +36,7 @@ button,input{font:inherit}button{cursor:pointer}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:-1px}.dot.ok{background:var(--green);box-shadow:0 0 8px #27c45b70}.dot.bad{background:var(--red);box-shadow:0 0 8px #f1495570}.state-warn{color:#ffd36a}
 
 #form{min-height:0;height:100%}
-.panels{height:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,40fr) minmax(0,25fr) minmax(0,35fr);gap:var(--gap);min-width:0;min-height:0}
+.panels{height:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,40fr) minmax(0,27fr) minmax(0,33fr);gap:var(--gap);min-width:0;min-height:0}
 .panel:nth-child(1){grid-column:1;grid-row:1/3}.panel:nth-child(2){grid-column:2;grid-row:1}.panel:nth-child(3){grid-column:1;grid-row:3}.panel:nth-child(4){grid-column:2;grid-row:2/4}
 .panel{min-width:0;min-height:0;border-radius:15px;padding:clamp(10px,1.45vh,17px);display:flex;flex-direction:column;overflow:auto;scrollbar-width:thin;scrollbar-color:#294765 transparent}
 .panel-head{display:flex;gap:9px;align-items:flex-start;margin-bottom:clamp(7px,1.1vh,12px);flex:0 0 auto}
