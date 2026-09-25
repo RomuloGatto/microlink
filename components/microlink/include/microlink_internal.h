@@ -45,7 +45,10 @@ extern "C" {
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
 
-#define ML_TASK_DERP_TX_STACK   (14 * 1024)
+/* DERP uses ~3.5KB on the WROOM test target (high-water mark leaves
+ * ~10.5KB free with the old 14KB stack). 8KB keeps >4KB safety margin while
+ * returning 6KB of precious contiguous internal RAM to control-plane/H2. */
+#define ML_TASK_DERP_TX_STACK   (8 * 1024)
 #define ML_TASK_DERP_TX_PRIO    5
 #define ML_TASK_DERP_TX_CORE    0
 
