@@ -324,6 +324,15 @@ static const char *watchdog_state_name(watchdog_state_t state) {
     }
 }
 
+static const char *watchdog_state_label(watchdog_state_t state) {
+    switch (state) {
+        case WD_NORMAL:            return "monitorando";
+        case WD_POWER_CUT:         return "fonte desligada";
+        case WD_WAITING_FOR_MODEM: return "aguardando modem";
+        default:                   return "desconhecido";
+    }
+}
+
 static void refresh_reboot_window(uint64_t now) {
     if (now - reboot_window_started_ms >= cfg_reboot_window_ms()) {
         reboot_window_started_ms = now;
@@ -938,7 +947,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
         vpn_ip,
         consecutive_failures, app_cfg.failures_before_reboot,
         automatic_reboots, app_cfg.max_auto_reboots,
-        watchdog_state_name(wd_state),
+        watchdog_state_label(wd_state),
         (unsigned)app_cfg.modem_off_s,
         (unsigned)app_cfg.modem_off_s);
 
