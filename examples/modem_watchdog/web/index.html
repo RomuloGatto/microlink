@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang='pt-BR'>
+<html lang='en'>
 <head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -21,51 +21,51 @@
 </svg>
 <div class='app'>
 <header class='hero'>
-<div class='brand'><div class='brandmark'><svg><use href='#wifi'/></svg></div><div><h1>Modem Watchdog</h1><p>Monitoramento e reinicio automatico do modem</p></div></div>
+<div class='brand'><div class='brandmark'><svg><use href='#wifi'/></svg></div><div><h1>Modem Watchdog</h1><p>Automatic modem monitoring and recovery</p></div></div>
 <div class='hero-actions'>
 <a class='health-link' href='/health' target='_blank'>Health JSON</a>
-<button id='ota' class='btn btn-secondary' type='button'>Atualizar firmware</button>
+<button id='ota' class='btn btn-secondary' type='button'>Update firmware</button>
 <input id='ota_file' type='file' accept='.bin,application/octet-stream' hidden>
-<button id='save' class='btn btn-primary' type='submit' form='form'>Salvar configuracoes</button>
-<button id='reboot' class='btn btn-danger' type='button'>Reiniciar modem</button>
+<button id='save' class='btn btn-primary' type='submit' form='form'>Save settings</button>
+<button id='reboot' class='btn btn-danger' type='button'>Restart modem</button>
 </div>
 </header>
-<div id='pending' class='notice'>Nova rede Wi-Fi em validacao. Se ela nao conectar, a configuracao anterior sera restaurada automaticamente.</div>
+<div id='pending' class='notice'>New Wi-Fi network is being validated. If it cannot connect, the previous configuration will be restored automatically.</div>
 <div class='workspace'>
-<aside class='stats' aria-label='Indicadores de status'>
+<aside class='stats' aria-label='Status indicators'>
 <div class='stat'><div class='stat-icon'><svg><use href='#wifi'/></svg></div><div><div class='stat-label'>Wi-Fi</div><div id='st_wifi' class='stat-value'>-</div></div></div>
 <div class='stat'><div class='stat-icon'><svg><use href='#server'/></svg></div><div><div class='stat-label'>Local IP</div><div id='st_local' class='stat-value'>-</div></div></div>
 <div class='stat'><div class='stat-icon'><svg><use href='#share'/></svg></div><div><div class='stat-label'>Tailscale</div><div id='st_ts' class='stat-value'>-</div></div></div>
 <div class='stat'><div class='stat-icon'><svg><use href='#server'/></svg></div><div><div class='stat-label'>Tailscale IP</div><div id='st_ip' class='stat-value'>-</div></div></div>
-<div class='stat'><div class='stat-icon'><svg><use href='#warn'/></svg></div><div><div class='stat-label'>Falhas</div><div id='st_fail' class='stat-value'>-</div></div></div>
-<div class='stat'><div class='stat-icon'><svg><use href='#refresh'/></svg></div><div><div class='stat-label'>Reboots auto</div><div id='st_reboots' class='stat-value'>-</div></div></div>
-<div class='stat'><div class='stat-icon'><svg><use href='#clock'/></svg></div><div><div class='stat-label'>Estado</div><div id='st_state' class='stat-value'>-</div></div></div>
+<div class='stat'><div class='stat-icon'><svg><use href='#warn'/></svg></div><div><div class='stat-label'>Failures</div><div id='st_fail' class='stat-value'>-</div></div></div>
+<div class='stat'><div class='stat-icon'><svg><use href='#refresh'/></svg></div><div><div class='stat-label'>Auto reboots</div><div id='st_reboots' class='stat-value'>-</div></div></div>
+<div class='stat'><div class='stat-icon'><svg><use href='#clock'/></svg></div><div><div class='stat-label'>State</div><div id='st_state' class='stat-value'>-</div></div></div>
 </aside>
 <form id='form'>
 <div class='panels'>
 <section class='panel'>
-<div class='panel-head'><div class='panel-icon'><svg><use href='#wifi'/></svg></div><div><h2>Conectividade</h2><p class='panel-sub'>Configuracoes de rede e autenticacao</p></div></div>
+<div class='panel-head'><div class='panel-icon'><svg><use href='#wifi'/></svg></div><div><h2>Connectivity</h2><p class='panel-sub'>Network and authentication settings</p></div></div>
 <div class='fields'>
 <div class='field full'><label>Wi-Fi SSID</label><input id='wifi_ssid' class='input' maxlength='32' required></div>
-<div class='field full'><label>Wi-Fi password</label><div class='input-wrap'><input id='wifi_password' class='input has-eye' type='password' maxlength='64' autocomplete='new-password'><button class='eye' type='button' data-eye='wifi_password'><svg><use href='#eye'/></svg></button></div><div class='hint'>Deixe em branco para manter a senha atual.</div></div>
+<div class='field full'><label>Wi-Fi password</label><div class='input-wrap'><input id='wifi_password' class='input has-eye' type='password' maxlength='64' autocomplete='new-password'><button class='eye' type='button' data-eye='wifi_password'><svg><use href='#eye'/></svg></button></div><div class='hint'>Leave blank to keep the current password.</div></div>
 <div class='field'><label>Device name</label><input id='device_name' class='input' maxlength='47'></div>
 <div class='field'><label>Priority peer IP</label><input id='priority_peer_ip' class='input' maxlength='15' placeholder='optional'></div>
-<div class='field full'><label>Auth / pre-auth key</label><div class='input-wrap'><input id='auth_key' class='input has-eye' type='password' maxlength='95' autocomplete='new-password'><button class='eye' type='button' data-eye='auth_key'><svg><use href='#eye'/></svg></button></div><div class='hint'>Deixe em branco para manter a chave atual.</div></div>
+<div class='field full'><label>Auth / pre-auth key</label><div class='input-wrap'><input id='auth_key' class='input has-eye' type='password' maxlength='95' autocomplete='new-password'><button class='eye' type='button' data-eye='auth_key'><svg><use href='#eye'/></svg></button></div><div class='hint'>Leave blank to keep the current key.</div></div>
 </div>
 </section>
 <section class='panel'>
-<div class='panel-head'><div class='panel-icon'><svg><use href='#server'/></svg></div><div><h2>Control plane</h2><p class='panel-sub'>Conexao com o servidor Tailscale (headscale)</p></div></div>
+<div class='panel-head'><div class='panel-icon'><svg><use href='#server'/></svg></div><div><h2>Control plane</h2><p class='panel-sub'>Connection to the Tailscale control server (Headscale)</p></div></div>
 <div class='field' style='margin-bottom:clamp(7px,1.1vh,11px)'><label>Hostname</label><input id='ctrl_host' class='input' maxlength='63' required></div>
-<div class='switch-row'><div><div class='switch-title'>Use TLS</div><div class='switch-desc'>Porta 443 quando ativo; porta 80 quando desativado.</div></div><label class='switch'><input id='ctrl_tls' type='checkbox'><span></span></label></div>
-<div class='hint'>A Noise public key e descoberta automaticamente pelo endpoint /key do control plane.</div>
+<div class='switch-row'><div><div class='switch-title'>Use TLS</div><div class='switch-desc'>Port 443 when enabled; port 80 when disabled.</div></div><label class='switch'><input id='ctrl_tls' type='checkbox'><span></span></label></div>
+<div class='hint'>The Noise public key is discovered automatically from the control plane /key endpoint.</div>
 </section>
 <section class='panel'>
-<div class='panel-head'><div class='panel-icon'><svg><use href='#route'/></svg></div><div><h2>Routing</h2><p class='panel-sub'>Anuncio da rede local</p></div></div>
-<div class='switch-row'><div><div class='switch-title'>Subnet router</div><div class='switch-desc'>Anuncia a LAN por este ESP.</div></div><label class='switch'><input id='subnet_enabled' type='checkbox'><span></span></label></div>
+<div class='panel-head'><div class='panel-icon'><svg><use href='#route'/></svg></div><div><h2>Routing</h2><p class='panel-sub'>Local network advertisement</p></div></div>
+<div class='switch-row'><div><div class='switch-title'>Subnet router</div><div class='switch-desc'>Advertises the LAN through this ESP.</div></div><label class='switch'><input id='subnet_enabled' type='checkbox'><span></span></label></div>
 <div class='field'><label>Advertised subnet</label><input id='subnet_route' class='input' maxlength='23' placeholder='192.168.0.0/24'></div>
 </section>
 <section class='panel'>
-<div class='panel-head'><div class='panel-icon'><svg><use href='#pulse'/></svg></div><div><h2>Watchdog</h2><p class='panel-sub'>Monitoramento da internet e reinicio do modem</p></div></div>
+<div class='panel-head'><div class='panel-icon'><svg><use href='#pulse'/></svg></div><div><h2>Watchdog</h2><p class='panel-sub'>Internet monitoring and modem recovery</p></div></div>
 <div class='watch-grid'>
 <div class='field'><label>Check interval (s)</label><input id='check_interval_s' class='input' type='number' min='5' max='3600'></div>
 <div class='field'><label>Failures before reboot</label><input id='failures_before_reboot' class='input' type='number' min='1' max='20'></div>
@@ -74,7 +74,7 @@
 <div class='field'><label>Max auto reboots</label><input id='max_auto_reboots' class='input' type='number' min='1' max='20'></div>
 <div class='field'><label>Reboot window (s)</label><input id='reboot_window_s' class='input' type='number' min='60' max='86400'></div>
 </div>
-<div class='watch-note'>A energia sera cortada por <span id='off_note'>20</span>s. Status atualizado a cada 10s.</div>
+<div class='watch-note'>Power will be cut for <span id='off_note'>20</span>s. Status refreshes every 10s.</div>
 </section>
 </div>
 </form>
@@ -82,9 +82,9 @@
 </div>
 <div id='toast' class='toast'></div>
 <div id='overlay' class='overlay'><div class='modal'>
-<div class='modal-top'><div id='modal_symbol' class='modal-symbol'><svg><use href='#warn'/></svg></div><div><h3 id='modal_title'>Reiniciar modem?</h3><p id='modal_desc'>O ESP vai cortar a energia do modem e ligar novamente.</p></div></div>
-<div id='countdown' class='countdown'><div class='count-num'><span id='count_value'>20</span><span id='count_suffix'>s</span></div><div id='count_label' class='count-label'>religando a fonte em...</div><div class='progress'><div id='progress'></div></div></div>
-<div id='modal_actions' class='modal-actions'><button id='cancel' class='modal-btn' type='button'>Cancelar</button><button id='confirm' class='modal-btn danger' type='button'>Reiniciar</button></div>
+<div class='modal-top'><div id='modal_symbol' class='modal-symbol'><svg><use href='#warn'/></svg></div><div><h3 id='modal_title'>Restart modem?</h3><p id='modal_desc'>The ESP will cut modem power and turn it back on.</p></div></div>
+<div id='countdown' class='countdown'><div class='count-num'><span id='count_value'>20</span><span id='count_suffix'>s</span></div><div id='count_label' class='count-label'>restoring power in...</div><div class='progress'><div id='progress'></div></div></div>
+<div id='modal_actions' class='modal-actions'><button id='cancel' class='modal-btn' type='button'>Cancel</button><button id='confirm' class='modal-btn danger' type='button'>Restart</button></div>
 </div></div>
 <script src='/app.js'></script>
 </body>
