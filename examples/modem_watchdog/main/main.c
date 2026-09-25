@@ -417,6 +417,419 @@ static void watchdog_task(void *arg) {
  * HTTP UI
  * ========================================================================== */
 
+/* Settings are deliberately served by this app instead of MicroLink's
+ * optional config HTTP server so port 80 stays owned by one lightweight
+ * httpd instance on the RAM-constrained WROOM. */
+static bool valid_hex64(const char *s) {
+    if (!s || s[0] == '\0') return true;
+    if (strlen(s) != 64) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char ch = s[i];
+        if (!((ch >= '0' && ch <= '9') ||
+              (ch >= 'a' && ch <= 'f') ||
+              (ch >= 'A' && ch <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool valid_ipv4_string(const char *s) {
+    if (!s || !s[0]) return false;
+    struct in_addr addr;
+    return inet_pton(AF_INET, s, &addr) == 1;
+}
+
+static bool valid_ipv4_cidr(const char *s) {
+    if (!s || !s[0]) return false;
+    char ip[16];
+    unsigned prefix = 0;
+    char extra = '\0';
+    if (sscanf(s, "%15[^/]/%u%c", ip, &prefix, &extra) != 2) return false;
+    return prefix >= 1 && prefix <= 32 && valid_ipv4_string(ip);
+}
+
+static char *read_http_body(httpd_req_t *req, size_t max_len) {
+    if (!req || req->content_len <= 0 || (size_t)req->content_len > max_len) {
+        return NULL;
+    }
+    char *buf = malloc((size_t)req->content_len + 1);
+    if (!buf) return NULL;
+
+    int got = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, buf + got, req->content_len - got);
+        if (n <= 0) {
+            free(buf);
+            return NULL;
+        }
+        got += n;
+    }
+    buf[got] = '\0';
+    return buf;
+}
+
+static esp_err_t send_json_obj(httpd_req_t *req, cJSON *json) {
+    if (!json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    char *body = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (!body) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_sendstr(req, body);
+    free(body);
+    return ret;
+}
+
+static esp_err_t send_json_error(httpd_req_t *req, const char *status,
+                                 const char *message) {
+    httpd_resp_set_status(req, status);
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddBoolToObject(json, "ok", false);
+    cJSON_AddStringToObject(json, "error", message ? message : "invalid request");
+    return send_json_obj(req, json);
+}
+
+static void delayed_restart_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
+static esp_err_t settings_api_get_handler(httpd_req_t *req) {
+    cJSON *json = cJSON_CreateObject();
+    if (!json) return ESP_FAIL;
+
+    cJSON_AddStringToObject(json, "wifi_ssid", app_cfg.wifi_ssid);
+    cJSON_AddBoolToObject(json, "wifi_password_configured", app_cfg.wifi_pass[0] != '\0');
+    cJSON_AddBoolToObject(json, "wifi_pending", app_cfg.wifi_pending != 0);
+
+    cJSON_AddStringToObject(json, "device_name", app_cfg.device_name);
+    cJSON_AddBoolToObject(json, "auth_key_configured", app_cfg.auth_key[0] != '\0');
+
+    cJSON_AddStringToObject(json, "ctrl_host", app_cfg.ctrl_host);
+    cJSON_AddBoolToObject(json, "ctrl_tls", app_cfg.ctrl_tls != 0);
+#ifdef CONFIG_ML_CTRL_TLS
+    cJSON_AddBoolToObject(json, "tls_supported", true);
+#else
+    cJSON_AddBoolToObject(json, "tls_supported", false);
+#endif
+    cJSON_AddStringToObject(json, "noise_pubkey", app_cfg.noise_pubkey_hex);
+
+    cJSON_AddBoolToObject(json, "subnet_enabled", app_cfg.subnet_enabled != 0);
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+    cJSON_AddBoolToObject(json, "subnet_supported", true);
+#else
+    cJSON_AddBoolToObject(json, "subnet_supported", false);
+#endif
+    cJSON_AddStringToObject(json, "subnet_route", app_cfg.subnet_route);
+    cJSON_AddStringToObject(json, "priority_peer_ip", app_cfg.priority_peer_ip);
+
+    cJSON_AddNumberToObject(json, "check_interval_s", app_cfg.check_interval_s);
+    cJSON_AddNumberToObject(json, "failures_before_reboot", app_cfg.failures_before_reboot);
+    cJSON_AddNumberToObject(json, "modem_off_s", app_cfg.modem_off_s);
+    cJSON_AddNumberToObject(json, "modem_boot_s", app_cfg.modem_boot_s);
+    cJSON_AddNumberToObject(json, "max_auto_reboots", app_cfg.max_auto_reboots);
+    cJSON_AddNumberToObject(json, "reboot_window_s", app_cfg.reboot_window_s);
+
+    return send_json_obj(req, json);
+}
+
+static bool json_copy_optional_string(cJSON *root, const char *name,
+                                      char *dst, size_t dst_len,
+                                      bool empty_means_keep) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!item) return true;
+    if (!cJSON_IsString(item) || !item->valuestring) return false;
+    if (empty_means_keep && item->valuestring[0] == '\0') return true;
+    if (strlen(item->valuestring) >= dst_len) return false;
+    copy_str(dst, dst_len, item->valuestring);
+    return true;
+}
+
+static bool json_uint_in_range(cJSON *root, const char *name,
+                               uint32_t min, uint32_t max, uint32_t *out) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsNumber(item)) return false;
+    double d = item->valuedouble;
+    if (d < (double)min || d > (double)max || d != (double)(uint32_t)d) {
+        return false;
+    }
+    *out = (uint32_t)d;
+    return true;
+}
+
+static esp_err_t settings_api_post_handler(httpd_req_t *req) {
+    char *body = read_http_body(req, 4096);
+    if (!body) {
+        return send_json_error(req, "400 Bad Request", "invalid or empty request body");
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        return send_json_error(req, "400 Bad Request", "invalid JSON");
+    }
+
+    app_settings_t next = app_cfg;
+
+    cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid");
+    if (!cJSON_IsString(ssid) || !ssid->valuestring ||
+        ssid->valuestring[0] == '\0' || strlen(ssid->valuestring) > 32) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "Wi-Fi SSID must be 1-32 characters");
+    }
+
+    cJSON *wifi_pass = cJSON_GetObjectItemCaseSensitive(root, "wifi_password");
+    if (wifi_pass && (!cJSON_IsString(wifi_pass) || !wifi_pass->valuestring ||
+                      strlen(wifi_pass->valuestring) > 64)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "Wi-Fi password is too long");
+    }
+
+    bool wifi_changed = strcmp(ssid->valuestring, app_cfg.wifi_ssid) != 0;
+    if (wifi_pass && wifi_pass->valuestring[0] != '\0' &&
+        strcmp(wifi_pass->valuestring, app_cfg.wifi_pass) != 0) {
+        wifi_changed = true;
+    }
+
+    if (wifi_changed) {
+        copy_str(next.prev_wifi_ssid, sizeof(next.prev_wifi_ssid), app_cfg.wifi_ssid);
+        copy_str(next.prev_wifi_pass, sizeof(next.prev_wifi_pass), app_cfg.wifi_pass);
+        next.wifi_pending = 1;
+        copy_str(next.wifi_ssid, sizeof(next.wifi_ssid), ssid->valuestring);
+        if (wifi_pass && wifi_pass->valuestring[0] != '\0') {
+            copy_str(next.wifi_pass, sizeof(next.wifi_pass), wifi_pass->valuestring);
+        }
+    }
+
+    if (!json_copy_optional_string(root, "device_name",
+                                   next.device_name, sizeof(next.device_name), false) ||
+        !json_copy_optional_string(root, "auth_key",
+                                   next.auth_key, sizeof(next.auth_key), true) ||
+        !json_copy_optional_string(root, "ctrl_host",
+                                   next.ctrl_host, sizeof(next.ctrl_host), false) ||
+        !json_copy_optional_string(root, "noise_pubkey",
+                                   next.noise_pubkey_hex, sizeof(next.noise_pubkey_hex), false) ||
+        !json_copy_optional_string(root, "subnet_route",
+                                   next.subnet_route, sizeof(next.subnet_route), false) ||
+        !json_copy_optional_string(root, "priority_peer_ip",
+                                   next.priority_peer_ip, sizeof(next.priority_peer_ip), false)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "one or more text fields are invalid");
+    }
+
+    if (next.ctrl_host[0] == '\0' || strstr(next.ctrl_host, "://") ||
+        strchr(next.ctrl_host, '/') || strchr(next.ctrl_host, ':')) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "control-plane host must be a hostname only");
+    }
+    if (!valid_hex64(next.noise_pubkey_hex)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "Noise public key must be 64 hex characters");
+    }
+    if (next.priority_peer_ip[0] && !valid_ipv4_string(next.priority_peer_ip)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "priority peer must be an IPv4 address");
+    }
+
+    cJSON *tls = cJSON_GetObjectItemCaseSensitive(root, "ctrl_tls");
+    if (!cJSON_IsBool(tls)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "ctrl_tls must be boolean");
+    }
+#ifdef CONFIG_ML_CTRL_TLS
+    next.ctrl_tls = cJSON_IsTrue(tls) ? 1 : 0;
+#else
+    if (cJSON_IsTrue(tls)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "TLS support is not compiled into this firmware");
+    }
+    next.ctrl_tls = 0;
+#endif
+
+    cJSON *subnet = cJSON_GetObjectItemCaseSensitive(root, "subnet_enabled");
+    if (!cJSON_IsBool(subnet)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "subnet_enabled must be boolean");
+    }
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+    next.subnet_enabled = cJSON_IsTrue(subnet) ? 1 : 0;
+#else
+    if (cJSON_IsTrue(subnet)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "subnet routing is not compiled into this firmware");
+    }
+    next.subnet_enabled = 0;
+#endif
+    if (next.subnet_enabled && !valid_ipv4_cidr(next.subnet_route)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "subnet route must be an IPv4 CIDR");
+    }
+
+    uint32_t v = 0;
+    if (!json_uint_in_range(root, "check_interval_s", 5, 3600, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "check interval must be 5-3600 seconds");
+    }
+    next.check_interval_s = v;
+    if (!json_uint_in_range(root, "failures_before_reboot", 1, 20, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "failure threshold must be 1-20");
+    }
+    next.failures_before_reboot = (uint8_t)v;
+    if (!json_uint_in_range(root, "modem_off_s", 1, 120, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "power-off duration must be 1-120 seconds");
+    }
+    next.modem_off_s = (uint16_t)v;
+    if (!json_uint_in_range(root, "modem_boot_s", 10, 1800, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "boot grace period must be 10-1800 seconds");
+    }
+    next.modem_boot_s = (uint16_t)v;
+    if (!json_uint_in_range(root, "max_auto_reboots", 1, 20, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "automatic reboot limit must be 1-20");
+    }
+    next.max_auto_reboots = (uint8_t)v;
+    if (!json_uint_in_range(root, "reboot_window_s", 60, 86400, &v)) {
+        cJSON_Delete(root);
+        return send_json_error(req, "400 Bad Request", "reboot window must be 60-86400 seconds");
+    }
+    next.reboot_window_s = v;
+
+    cJSON_Delete(root);
+
+    app_cfg = next;
+    esp_err_t err = app_config_save();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist settings: %s", esp_err_to_name(err));
+        return send_json_error(req, "500 Internal Server Error", "failed to persist settings");
+    }
+
+    ESP_LOGI(TAG, "Runtime settings saved%s", wifi_changed ? " (Wi-Fi pending validation)" : "");
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "restart", true);
+    cJSON_AddBoolToObject(resp, "wifi_changed", wifi_changed);
+    esp_err_t ret = send_json_obj(req, resp);
+
+    BaseType_t ok = xTaskCreate(delayed_restart_task, "settings_restart",
+                                2048, NULL, 8, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Could not schedule settings restart");
+    }
+    return ret;
+}
+
+static const char SETTINGS_PAGE_HTML[] =
+    "<!doctype html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Watchdog Settings</title>"
+    "<style>"
+    "*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#eef2f7;"
+    "font:15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:24px}"
+    ".wrap{max-width:680px;margin:auto}.top{display:flex;align-items:center;gap:12px;margin-bottom:18px}"
+    ".back{color:#9fb0c5;text-decoration:none;font-size:22px}.title{font-size:22px;font-weight:750}"
+    ".card{background:#121821;border:1px solid #202a36;border-radius:18px;padding:18px;margin-bottom:14px}"
+    ".card h2{font-size:15px;margin:0 0 14px;color:#dce6f2}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}"
+    ".field{margin-bottom:12px}.field:last-child{margin-bottom:0}.field label{display:block;color:#8fa0b4;"
+    "font-size:12px;margin-bottom:6px}.field input{width:100%;border:1px solid #293442;background:#0d131b;"
+    "color:#edf3fa;border-radius:11px;padding:11px 12px;font:inherit;outline:none}.field input:focus{border-color:#5278a8}"
+    ".hint{font-size:11px;color:#65768a;margin-top:5px;line-height:1.35}.row{display:flex;align-items:center;"
+    "justify-content:space-between;gap:14px}.toggle{position:relative;width:44px;height:24px;flex:0 0 auto}"
+    ".toggle input{display:none}.toggle span{position:absolute;inset:0;border-radius:99px;background:#313d4c;cursor:pointer}"
+    ".toggle span:after{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;"
+    "background:#fff;transition:.18s}.toggle input:checked+span{background:#2f9e44}.toggle input:checked+span:after{transform:translateX(20px)}"
+    ".save{width:100%;padding:14px;border:0;border-radius:12px;background:#3b82f6;color:white;font-size:15px;"
+    "font-weight:750;cursor:pointer}.save:disabled{opacity:.55;cursor:wait}.notice{display:none;padding:11px 12px;"
+    "border-radius:11px;margin-bottom:14px;background:#362b12;color:#ffd98b;font-size:12px}.ov{position:fixed;"
+    "inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:20px;z-index:20;"
+    "backdrop-filter:blur(5px)}.ov.show{display:flex}.modal{width:min(420px,100%);background:#151c25;border:1px solid #293442;"
+    "border-radius:20px;padding:22px;text-align:center}.count{font-size:44px;font-weight:800;margin:16px 0 4px}"
+    ".muted{color:#8798ac;font-size:12px;line-height:1.45}.err{color:#ff8b8b;margin-top:10px;font-size:12px}"
+    "@media(max-width:560px){.grid{grid-template-columns:1fr}}"
+    "</style></head><body><div class='wrap'>"
+    "<div class='top'><a class='back' href='/'>&#8249;</a><div class='title'>Settings</div></div>"
+    "<div id='pending' class='notice'>A Wi-Fi change is still being validated. If it fails, the previous network will be restored automatically.</div>"
+    "<form id='form'>"
+    "<div class='card'><h2>Network</h2>"
+    "<div class='field'><label>Wi-Fi SSID</label><input id='wifi_ssid' maxlength='32' required></div>"
+    "<div class='field'><label>Wi-Fi password</label><input id='wifi_password' type='password' maxlength='64' "
+    "autocomplete='new-password'><div id='wifi_hint' class='hint'>Leave blank to keep the current password.</div></div>"
+    "</div>"
+    "<div class='card'><h2>Tailnet</h2><div class='grid'>"
+    "<div class='field'><label>Device name</label><input id='device_name' maxlength='47'></div>"
+    "<div class='field'><label>Priority peer IP</label><input id='priority_peer_ip' placeholder='optional'></div>"
+    "</div><div class='field'><label>Auth / pre-auth key</label><input id='auth_key' type='password' maxlength='95' "
+    "autocomplete='new-password'><div id='auth_hint' class='hint'>Leave blank to keep the current key.</div></div>"
+    "</div>"
+    "<div class='card'><h2>Control plane</h2>"
+    "<div class='field'><label>Hostname</label><input id='ctrl_host' maxlength='63' required></div>"
+    "<div class='row field'><div><label style='margin:0'>Use TLS</label><div class='hint'>Port 443 when enabled; port 80 when disabled.</div></div>"
+    "<label class='toggle'><input id='ctrl_tls' type='checkbox'><span></span></label></div>"
+    "<div class='field'><label>Noise public key</label><input id='noise_pubkey' maxlength='64' "
+    "spellcheck='false'><div class='hint'>64 hex characters. This key authenticates the control plane below TLS.</div></div>"
+    "</div>"
+    "<div class='card'><h2>Routing</h2>"
+    "<div class='row field'><div><label style='margin:0'>Subnet router</label><div class='hint'>Advertise the LAN through this ESP.</div></div>"
+    "<label class='toggle'><input id='subnet_enabled' type='checkbox'><span></span></label></div>"
+    "<div class='field'><label>Advertised subnet</label><input id='subnet_route' placeholder='192.168.100.0/24'></div>"
+    "</div>"
+    "<div class='card'><h2>Watchdog</h2><div class='grid'>"
+    "<div class='field'><label>Internet check interval (s)</label><input id='check_interval_s' type='number' min='5' max='3600'></div>"
+    "<div class='field'><label>Failures before reboot</label><input id='failures_before_reboot' type='number' min='1' max='20'></div>"
+    "<div class='field'><label>Power-off duration (s)</label><input id='modem_off_s' type='number' min='1' max='120'></div>"
+    "<div class='field'><label>Boot grace period (s)</label><input id='modem_boot_s' type='number' min='10' max='1800'></div>"
+    "<div class='field'><label>Max automatic reboots</label><input id='max_auto_reboots' type='number' min='1' max='20'></div>"
+    "<div class='field'><label>Reboot limit window (s)</label><input id='reboot_window_s' type='number' min='60' max='86400'></div>"
+    "</div></div>"
+    "<button id='save' class='save' type='submit'>Save settings</button><div id='error' class='err'></div>"
+    "</form></div>"
+    "<div id='modal' class='ov'><div class='modal'><h3 id='modal_title'>Settings saved</h3>"
+    "<div id='count' class='count'>5s</div><div id='modal_text' class='muted'>Restarting the ESP to apply the new configuration.</div>"
+    "</div></div>"
+    "<script>"
+    "const $=id=>document.getElementById(id);let cfg={};"
+    "async function load(){const r=await fetch('/api/settings');cfg=await r.json();"
+    "['wifi_ssid','device_name','ctrl_host','noise_pubkey','subnet_route','priority_peer_ip',"
+    "'check_interval_s','failures_before_reboot','modem_off_s','modem_boot_s','max_auto_reboots','reboot_window_s']"
+    ".forEach(k=>$(k).value=cfg[k]??'');"
+    "$('ctrl_tls').checked=!!cfg.ctrl_tls;$('subnet_enabled').checked=!!cfg.subnet_enabled;"
+    "$('ctrl_tls').disabled=!cfg.tls_supported;$('subnet_enabled').disabled=!cfg.subnet_supported;"
+    "$('wifi_password').placeholder=cfg.wifi_password_configured?'Configured · leave blank to keep':'Enter password';"
+    "$('auth_key').placeholder=cfg.auth_key_configured?'Configured · leave blank to keep':'Enter auth key';"
+    "$('pending').style.display=cfg.wifi_pending?'block':'none';}"
+    "$('form').addEventListener('submit',async e=>{e.preventDefault();$('save').disabled=true;$('error').textContent='';"
+    "const payload={wifi_ssid:$('wifi_ssid').value.trim(),wifi_password:$('wifi_password').value,"
+    "device_name:$('device_name').value.trim(),auth_key:$('auth_key').value.trim(),ctrl_host:$('ctrl_host').value.trim(),"
+    "ctrl_tls:$('ctrl_tls').checked,noise_pubkey:$('noise_pubkey').value.trim(),subnet_enabled:$('subnet_enabled').checked,"
+    "subnet_route:$('subnet_route').value.trim(),priority_peer_ip:$('priority_peer_ip').value.trim(),"
+    "check_interval_s:+$('check_interval_s').value,failures_before_reboot:+$('failures_before_reboot').value,"
+    "modem_off_s:+$('modem_off_s').value,modem_boot_s:+$('modem_boot_s').value,"
+    "max_auto_reboots:+$('max_auto_reboots').value,reboot_window_s:+$('reboot_window_s').value};"
+    "try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});"
+    "const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Save failed');"
+    "$('modal').classList.add('show');$('modal_text').textContent=j.wifi_changed?"
+    "'Restarting and testing the new Wi-Fi. If it cannot connect, the previous network will be restored automatically.':"
+    "'Restarting the ESP to apply the new configuration.';"
+    "let n=5;$('count').textContent=n+'s';const t=setInterval(()=>{n--;$('count').textContent=n+'s';"
+    "if(n<=0){clearInterval(t);location.href='/'}},1000);"
+    "}catch(err){$('error').textContent=err.message;$('save').disabled=false;}});load().catch(e=>$('error').textContent=e.message);"
+    "</script></body></html>";
+
+static esp_err_t settings_page_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, SETTINGS_PAGE_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t root_handler(httpd_req_t *req) {
     char vpn_ip[16] = "not-connected";
     if (ml) {
