@@ -330,7 +330,7 @@ static const char *watchdog_state_label(watchdog_state_t state) {
     switch (state) {
         case WD_NORMAL:            return "monitorando";
         case WD_POWER_CUT:         return "fonte desligada";
-        case WD_WAITING_FOR_MODEM: return "aguardando modem";
+        case WD_WAITING_FOR_MODEM: return "modem inicializando";
         default:                   return "desconhecido";
     }
 }
@@ -784,6 +784,7 @@ static const char DASHBOARD_HTML[] =
     ".stat>div:last-child{min-width:0}\n"
     ".stat-label{color:#a9bad1;font-size:clamp(9px,1.15vh,12px);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
     ".stat-value{font-weight:800;font-size:clamp(11px,1.5vh,14px);line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
+    "#st_state{white-space:normal;overflow:visible;text-overflow:clip}.state-countdown{display:block;margin-top:4px;font-size:.92em;font-variant-numeric:tabular-nums;color:#8ebcff}\n"
     ".dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:-1px}.dot.ok{background:var(--green);box-shadow:0 0 8px #27c45b70}.dot.bad{background:var(--red);box-shadow:0 0 8px #f1495570}.state-warn{color:#ffd36a}\n"
     "\n"
     "#form{min-height:0;height:100%}\n"
@@ -887,7 +888,9 @@ static const char DASHBOARD_HTML[] =
     "</div></div>\n"
     "<script>\n"
     "const $=id=>document.getElementById(id);\n"
-    "let busy=false,settings={},healthTimer=null,countTimer=null,baseline='';\n"
+    "let busy=false,settings={},healthTimer=null,countTimer=null,stateTickTimer=null,baseline='',stateName='',stateLabel='',stateRemaining=0,stateSyncMs=0;\n"
+    "function formatCountdown(sec){sec=Math.max(0,Math.ceil(sec));const m=Math.floor(sec/60),s=sec%60;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}\n"
+    "function renderState(){const el=$('st_state');if(!el)return;let html=stateLabel||stateName||'-';if(stateName==='waiting-for-modem'&&stateRemaining>0){const elapsed=Math.floor((Date.now()-stateSyncMs)/1000),left=Math.max(0,stateRemaining-elapsed);html+='<span class=\'state-countdown\'>'+formatCountdown(left)+'</span>';if(left===0)setTimeout(loadHealth,250)}el.innerHTML=html;el.classList.toggle('state-warn',stateName!=='monitoring')}\n"
     "function toast(msg,type){const el=$('toast');el.textContent=msg;el.className='toast show '+(type||'success');clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast',3000)}\n"
     "function dot(ok,label){return \"<span class='dot \"+(ok?'ok':'bad')+\"'></span>\"+label}\n"
     "function setv(id,v){$(id).value=v==null?'':v}\n"
@@ -924,8 +927,7 @@ static const char DASHBOARD_HTML[] =
     "  $('st_wifi').innerHTML=dot(!!h.wifi,h.wifi?'conectado':'desconectado');\n"
     "  $('st_local').textContent=h.local_ip||'-';$('st_ts').innerHTML=dot(!!h.tailscale_connected,h.tailscale_connected?'conectado':'desconectado');\n"
     "  $('st_ip').textContent=h.tailscale_ip||'-';$('st_fail').textContent=String(h.failures)+' / '+String(h.failures_limit);\n"
-    "  $('st_reboots').textContent=String(h.auto_reboots)+' / '+String(h.auto_reboots_limit);$('st_state').textContent=h.state_label||h.state||'-';\n"
-    "  $('st_state').classList.toggle('state-warn',h.state!=='monitoring');\n"
+    "  $('st_reboots').textContent=String(h.auto_reboots)+' / '+String(h.auto_reboots_limit);stateName=h.state||'';stateLabel=h.state_label||h.state||'-';stateRemaining=Number(h.state_remaining_s||0);stateSyncMs=Date.now();renderState();\n"
     "  $('pending').classList.toggle('show',!!h.wifi_pending);if(h.modem_off_s)$('off_note').textContent=h.modem_off_s\n"
     " }catch(e){}\n"
     "}\n"
@@ -952,7 +954,7 @@ static const char DASHBOARD_HTML[] =
     "document.querySelectorAll('[data-eye]').forEach(b=>b.onclick=()=>{const i=$(b.getAttribute('data-eye'));i.type=i.type==='password'?'text':'password'});\n"
     "$('form').addEventListener('submit',save);$('form').addEventListener('input',syncDirty);$('form').addEventListener('change',syncDirty);$('reboot').onclick=showConfirm;$('cancel').onclick=modalClose;$('confirm').onclick=doReboot;$('overlay').onclick=e=>{if(e.target===$('overlay'))modalClose()};document.addEventListener('keydown',e=>{if(e.key==='Escape')modalClose()});\n"
     "$('modem_off_s').addEventListener('input',()=>{$('off_note').textContent=$('modem_off_s').value||20});\n"
-    "Promise.all([loadSettings(),loadHealth()]).catch(e=>toast('Falha ao carregar dashboard','error'));healthTimer=setInterval(loadHealth,10000);\n"
+    "Promise.all([loadSettings(),loadHealth()]).catch(e=>toast('Falha ao carregar dashboard','error'));healthTimer=setInterval(loadHealth,10000);stateTickTimer=setInterval(renderState,1000);\n"
     "</script>\n"
     "</body>\n"
     "</html>\n";
@@ -984,10 +986,21 @@ static esp_err_t health_handler(httpd_req_t *req) {
         (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
     const bool tailscale_ok = ml && microlink_is_connected(ml);
 
-    char json[768];
+    uint32_t state_remaining_s = 0;
+    if (wd_state == WD_WAITING_FOR_MODEM) {
+        uint64_t now = now_ms();
+        uint64_t elapsed = now > state_started_ms ? now - state_started_ms : 0;
+        uint64_t total = cfg_modem_boot_ms();
+        if (elapsed < total) {
+            state_remaining_s = (uint32_t)((total - elapsed + 999ULL) / 1000ULL);
+        }
+    }
+
+    char json[800];
     int n = snprintf(
         json, sizeof(json),
         "{\"state\":\"%s\",\"state_label\":\"%s\","
+        "\"state_remaining_s\":%u,"
         "\"wifi\":%s,\"tailscale_connected\":%s,"
         "\"local_ip\":\"%s\",\"tailscale_ip\":\"%s\","
         "\"failures\":%d,\"failures_limit\":%u,"
@@ -997,6 +1010,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
         "\"heap_free\":%u,\"heap_largest\":%u}",
         watchdog_state_name(wd_state),
         watchdog_state_label(wd_state),
+        (unsigned)state_remaining_s,
         wifi_ok ? "true" : "false",
         tailscale_ok ? "true" : "false",
         local_ip,
