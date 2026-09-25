@@ -64,8 +64,9 @@ static void coord_close_conn(microlink_t *ml) {
     ml_coord_tls_free(ml);
 #endif
     if (ml->coord_sock >= 0) {
-                    coord_close_conn(ml);
-                }
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+    }
 }
 
 /* NodeKeyChallenge from EarlyNoise (stored between handshake and register) */
