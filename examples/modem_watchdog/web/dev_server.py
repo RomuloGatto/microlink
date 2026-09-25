@@ -37,7 +37,7 @@ CONFIG = {
 
 HEALTH_BASE = {
     "state": "monitoring",
-    "state_label": "monitorando",
+    "state_label": "monitoring",
     "state_remaining_s": 0,
     "firmware_version": "dev-local",
     "ota_slot": "ota_1",
