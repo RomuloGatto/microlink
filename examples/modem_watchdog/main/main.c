@@ -811,7 +811,7 @@ static const char SETTINGS_PAGE_HTML[] =
     "async function load(){const r=await fetch('/api/settings');cfg=await r.json();"
     "['wifi_ssid','device_name','ctrl_host','noise_pubkey','subnet_route','priority_peer_ip',"
     "'check_interval_s','failures_before_reboot','modem_off_s','modem_boot_s','max_auto_reboots','reboot_window_s']"
-    ".forEach(k=>$(k).value=cfg[k]??'');"
+    ".forEach(k=>$(k).value=cfg[k]==null?'':cfg[k]);"
     "$('ctrl_tls').checked=!!cfg.ctrl_tls;$('subnet_enabled').checked=!!cfg.subnet_enabled;"
     "$('ctrl_tls').disabled=!cfg.tls_supported;$('subnet_enabled').disabled=!cfg.subnet_supported;"
     "$('wifi_password').placeholder=cfg.wifi_password_configured?'Configured · leave blank to keep':'Enter password';"
