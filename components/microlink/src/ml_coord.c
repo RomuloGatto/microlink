@@ -2019,21 +2019,39 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
     }
     h2_recv[parse_len] = '\0';
 
-    /* On classic ESP32/WROOM there is no PSRAM and the full DERPMap dominates
-     * cJSON's allocation cost. We do not need the complete global DERP catalog
-     * to establish the tailnet: DERP and STUN already have compiled fallbacks,
-     * while Node + Peers are the state that must be parsed successfully.
+    /* The full DERPMap dominates cJSON's allocation cost. Do not rely on
+     * MALLOC_CAP_SPIRAM total size to decide whether we can afford it: some
+     * ESP-IDF configurations expose a non-zero SPIRAM-capable heap even when
+     * the allocations cJSON actually gets are still constrained/fragmented.
      *
-     * Strip DERPMap before cJSON builds its tree. Boards with PSRAM keep the
-     * full map and retain dynamic DERP-region selection. */
-    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
+     * Decide from the heap that cJSON will use right now. A ~20KB netmap with
+     * less than 48KB largest-block or 96KB total free has repeatedly failed
+     * while building the DERPMap tree on ESP32. Node + Peers are essential;
+     * DERP/STUN have compiled fallbacks, so strip only DERPMap under pressure. */
+    size_t parse_largest_free =
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t parse_total_free =
+        heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    bool low_parse_heap =
+        (parse_largest_free < (48 * 1024)) ||
+        (parse_total_free < (96 * 1024));
+
+    if (low_parse_heap) {
         size_t before = parse_len;
         size_t removed =
             strip_json_object_field_in_place((char *)h2_recv, &parse_len, "DERPMap");
         if (removed > 0) {
             ESP_LOGI(TAG,
-                     "Low-memory target: stripped DERPMap before JSON parse (%dKB -> %dKB)",
-                     (int)(before / 1024), (int)(parse_len / 1024));
+                     "Low-memory parse: stripped DERPMap (%dKB -> %dKB, largest=%dKB free=%dKB)",
+                     (int)(before / 1024),
+                     (int)(parse_len / 1024),
+                     (int)(parse_largest_free / 1024),
+                     (int)(parse_total_free / 1024));
+        } else {
+            ESP_LOGW(TAG,
+                     "Low-memory parse detected but DERPMap could not be stripped (largest=%dKB free=%dKB)",
+                     (int)(parse_largest_free / 1024),
+                     (int)(parse_total_free / 1024));
         }
     }
     h2_recv[parse_len] = '\0';
