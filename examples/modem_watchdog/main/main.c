@@ -1152,14 +1152,14 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     }
 
     if ((size_t)req->content_len > update_partition->size) {
-        ESP_LOGE(TAG, "OTA image too large: %d > %u",
-                 req->content_len, (unsigned)update_partition->size);
+        ESP_LOGE(TAG, "OTA image too large: %u > %u",
+                 (unsigned)req->content_len, (unsigned)update_partition->size);
         httpd_resp_set_status(req, "413 Payload Too Large");
         return httpd_resp_sendstr(req, "Firmware image does not fit OTA slot.\n");
     }
 
-    ESP_LOGW(TAG, "OTA upload starting: %d bytes -> %s",
-             req->content_len, update_partition->label);
+    ESP_LOGW(TAG, "OTA upload starting: %u bytes -> %s",
+             (unsigned)req->content_len, update_partition->label);
 
     esp_ota_handle_t ota_handle = 0;
     esp_err_t err =
