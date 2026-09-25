@@ -386,9 +386,13 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
          * here and are forwarded to the LAN via WiFi STA. Rewriting their
          * source to the ESP's LAN address means ordinary LAN devices can
          * reply without any route back to 100.64.0.0/10. */
-        int napt_err = ip_napt_enable_netif(netif, 1);
-        if (napt_err != ERR_OK) {
-            ESP_LOGE(TAG, "Failed to enable NAPT on WireGuard netif: %d", napt_err);
+        /* esp-lwip's low-level ip_napt_enable_netif() is boolean-like:
+         * 1 = success, 0 = failure. It does NOT return lwIP err_t/ERR_OK.
+         * Treating 1 as an error caused us to tear down a successfully
+         * initialized WireGuard netif on classic ESP32. */
+        int napt_ok = ip_napt_enable_netif(netif, 1);
+        if (napt_ok == 0) {
+            ESP_LOGE(TAG, "Failed to enable NAPT on WireGuard netif");
             wireguardif_shutdown(netif);
             netif_set_link_down(netif);
             netif_set_down(netif);
