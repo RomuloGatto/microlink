@@ -48,10 +48,10 @@ static const char *TAG = "modem_watchdog";
 #define RELAY_MODEM_OFF_LEVEL      0
 
 #define DEFAULT_CHECK_INTERVAL_S      60U
-#define DEFAULT_app_cfg.failures_before_reboot 5U
+#define DEFAULT_FAILURES_BEFORE_REBOOT 5U
 #define DEFAULT_MODEM_OFF_S            20U
 #define DEFAULT_MODEM_BOOT_S           300U
-#define DEFAULT_app_cfg.max_auto_reboots       3U
+#define DEFAULT_MAX_AUTO_REBOOTS       3U
 #define DEFAULT_REBOOT_WINDOW_S        7200U
 #define TCP_PROBE_TIMEOUT_MS           2500
 
@@ -124,10 +124,10 @@ static void app_config_defaults(app_settings_t *cfg) {
 #endif
 
     cfg->check_interval_s = DEFAULT_CHECK_INTERVAL_S;
-    cfg->failures_before_reboot = DEFAULT_app_cfg.failures_before_reboot;
+    cfg->failures_before_reboot = DEFAULT_FAILURES_BEFORE_REBOOT;
     cfg->modem_off_s = DEFAULT_MODEM_OFF_S;
     cfg->modem_boot_s = DEFAULT_MODEM_BOOT_S;
-    cfg->max_auto_reboots = DEFAULT_app_cfg.max_auto_reboots;
+    cfg->max_auto_reboots = DEFAULT_MAX_AUTO_REBOOTS;
     cfg->reboot_window_s = DEFAULT_REBOOT_WINDOW_S;
 }
 
