@@ -879,7 +879,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "</div>"
         "<div id='modal' class='ov'><div class='m'>"
         "<h3 id='mt'>Reiniciar modem?</h3>"
-        "<p id='md'>O ESP vai cortar a energia do modem por 20 segundos e ligar novamente.</p>"
+        "<p id='md'>O ESP vai cortar a energia do modem e ligar novamente.</p>"
         "<div id='count' class='count' style='display:none'></div>"
         "<div id='sub' class='sub' style='display:none'>religando a fonte em...</div>"
         "<div id='actions' class='actions'>"
@@ -896,12 +896,13 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "m.addEventListener('click',e=>{if(e.target===m)closeModal()});"
         "async function doReboot(){"
         "busy=true;a.style.display='none';t.textContent='Reiniciando modem';"
-        "d.textContent='Comando enviado ao ESP. A fonte do modem ficara desligada por 20 segundos.';"
+        "const secs=window.REBOOT_SECONDS||20;"
+        "d.textContent='Comando enviado ao ESP. A fonte do modem ficara desligada por '+secs+' segundos.';"
         "c.style.display='block';s.style.display='block';"
         "try{"
         "const r=await fetch('/reboot',{method:'POST'});"
         "if(!r.ok)throw new Error(await r.text());"
-        "let left=20;c.textContent=left+'s';"
+        "let left=secs;c.textContent=left+'s';"
         "const timer=setInterval(()=>{left--;c.textContent=left+'s';"
         "if(left<=0){clearInterval(timer);location.reload()}},1000);"
         "}catch(e){busy=false;c.style.display='none';s.style.display='none';"
@@ -923,8 +924,10 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "<div class='s'><div class='l'>Reboots auto</div><div class='v'>%d / %d</div></div>"
         "<div class='s'><div class='l'>Estado</div><div class='v'>%s</div></div>"
         "</div><a class='a' href='/health'>Ver JSON de health &#8594;</a>"
+        "<a class='a' href='/settings'>Configuracoes &#8594;</a>"
         "<button class='btn' type='button' onclick='openModal()'>Reiniciar modem</button>"
-        "<div class='n'>A energia sera cortada por 20 segundos · status atualiza a cada 10s</div>"
+        "<div class='n'>A energia sera cortada por %u segundos · status atualiza a cada 10s</div>"
+        "<script>window.REBOOT_SECONDS=%u;</script>"
         "</div>",
         healthy ? "ok" : "bad",
         healthy ? "ONLINE" : "ATENCAO",
@@ -934,7 +937,9 @@ static esp_err_t root_handler(httpd_req_t *req) {
         vpn_ip,
         consecutive_failures, app_cfg.failures_before_reboot,
         automatic_reboots, app_cfg.max_auto_reboots,
-        watchdog_state_name(wd_state));
+        watchdog_state_name(wd_state),
+        (unsigned)app_cfg.modem_off_s,
+        (unsigned)app_cfg.modem_off_s);
 
     if (n < 0 || n >= (int)sizeof(status)) {
         ESP_LOGE(TAG, "Watchdog UI status overflow (%d bytes)", n);
