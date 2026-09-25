@@ -8,6 +8,8 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_server
+        app_update
+        esp_app_format
         esp_driver_gpio
         espressif__cjson
         lwip
