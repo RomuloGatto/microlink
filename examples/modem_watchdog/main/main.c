@@ -988,7 +988,11 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
     }
 
     manual_reboot_requested = true;
-    return httpd_resp_sendstr(req, "Reboot requested. Power will be cut for 20 seconds.\n");
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "Reboot requested. Power will be cut for %u seconds.\n",
+             (unsigned)app_cfg.modem_off_s);
+    return httpd_resp_sendstr(req, msg);
 }
 
 static void start_http_server(void) {
