@@ -45,12 +45,6 @@ typedef struct {
      * internet exit node. */
     const char *advertise_route;
 
-    /* When false (default), an empty advertise_route falls back to the
-     * CONFIG_ML_SUBNET_ROUTE Kconfig value for backwards compatibility.
-     * Set true to make advertise_route authoritative at runtime; an empty
-     * string then explicitly disables subnet routing for this instance. */
-    bool advertise_route_override;
-
     /* Priority peer: guaranteed a WG slot even when peer table is full.
      * On large tailnets the NVS cache can fill the peer table at boot
      * before the priority peer arrives from MapResponse. When the table
@@ -77,6 +71,12 @@ typedef struct {
      * enabled at runtime when CONFIG_ML_CTRL_TLS is compiled in. */
     bool ctrl_tls_override;
     bool ctrl_tls;
+
+    /* When false (default), an empty advertise_route falls back to the
+     * CONFIG_ML_SUBNET_ROUTE Kconfig value for backwards compatibility.
+     * Set true to make advertise_route authoritative at runtime; an empty
+     * string then explicitly disables subnet routing for this instance. */
+    bool advertise_route_override;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
