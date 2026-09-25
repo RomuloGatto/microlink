@@ -32,7 +32,7 @@ On macOS the value can be extracted with:
 
 ```bash
 curl -fsSL 'https://headscale.novoagatto.com/key?v=88' \
-  | python3 -c 'import json,sys; print((json.load(sys.stdin).get("publicKey") or json.load(sys.stdin).get("legacyPublicKey")).removeprefix("mkey:"))'
+  | python3 -c 'import json,sys; j=json.load(sys.stdin); print((j.get("publicKey") or j.get("legacyPublicKey") or "").removeprefix("mkey:"))'
 ```
 
 If the one-liner fails because the endpoint response shape differs, print the
