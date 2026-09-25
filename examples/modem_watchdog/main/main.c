@@ -974,19 +974,38 @@ static esp_err_t health_handler(httpd_req_t *req) {
 
     const bool wifi_ok =
         (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+    const bool tailscale_ok = ml && microlink_is_connected(ml);
 
-    char json[384];
-    snprintf(json, sizeof(json),
-             "{\"state\":\"%s\",\"wifi\":%s,\"tailscale_connected\":%s,"
-             "\"tailscale_ip\":\"%s\",\"failures\":%d,\"auto_reboots\":%d}",
-             watchdog_state_name(wd_state),
-             wifi_ok ? "true" : "false",
-             (ml && microlink_is_connected(ml)) ? "true" : "false",
-             vpn_ip,
-             consecutive_failures,
-             automatic_reboots);
+    char json[640];
+    int n = snprintf(
+        json, sizeof(json),
+        "{\"state\":\"%s\",\"state_label\":\"%s\","
+        "\"wifi\":%s,\"tailscale_connected\":%s,"
+        "\"tailscale_ip\":\"%s\","
+        "\"failures\":%d,\"failures_limit\":%u,"
+        "\"auto_reboots\":%d,\"auto_reboots_limit\":%u,"
+        "\"modem_off_s\":%u,\"modem_boot_s\":%u,"
+        "\"check_interval_s\":%u,\"wifi_pending\":%s}",
+        watchdog_state_name(wd_state),
+        watchdog_state_label(wd_state),
+        wifi_ok ? "true" : "false",
+        tailscale_ok ? "true" : "false",
+        vpn_ip,
+        consecutive_failures,
+        (unsigned)app_cfg.failures_before_reboot,
+        automatic_reboots,
+        (unsigned)app_cfg.max_auto_reboots,
+        (unsigned)app_cfg.modem_off_s,
+        (unsigned)app_cfg.modem_boot_s,
+        (unsigned)app_cfg.check_interval_s,
+        app_cfg.wifi_pending ? "true" : "false");
+
+    if (n < 0 || n >= (int)sizeof(json)) {
+        return httpd_resp_send_500(req);
+    }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
