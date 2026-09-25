@@ -24,6 +24,7 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -481,6 +482,7 @@ static char *read_http_body(httpd_req_t *req, size_t max_len) {
 }
 
 static esp_err_t send_json_obj(httpd_req_t *req, cJSON *json) {
+    httpd_resp_set_hdr(req, "Connection", "close");
     if (!json) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -954,6 +956,7 @@ static const char DASHBOARD_HTML[] =
     "</html>\n";
 
 static esp_err_t dashboard_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
@@ -968,6 +971,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
 }
 
 static esp_err_t health_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Connection", "close");
     char vpn_ip[16] = "";
     if (ml) {
         uint32_t ip = microlink_get_vpn_ip(ml);
@@ -1013,6 +1017,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
 }
 
 static esp_err_t reboot_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Connection", "close");
     if (wd_state != WD_NORMAL) {
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_sendstr(req, "Modem reboot already in progress.\n");
@@ -1031,6 +1036,13 @@ static void start_http_server(void) {
     config.server_port = 80;
     config.stack_size = 4096;
     config.max_uri_handlers = 12;
+    /* The dashboard is a single inline page; it never needs a large pool of
+     * simultaneous HTTP sockets. Keeping this small prevents browser
+     * keep-alive/poll connections from pinning large lwIP TCP buffers. */
+    config.max_open_sockets = 3;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
 
     ESP_ERROR_CHECK(httpd_start(&http_server, &config));
 
