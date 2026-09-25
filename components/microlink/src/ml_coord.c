@@ -1922,28 +1922,37 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
         }
     }
 
-    /* cJSON allocates a tree while parsing. On classic ESP32 without PSRAM
-     * keeping the 64KB H2 receive window alive here leaves too little heap and
-     * cJSON fails part-way through the ~20KB Headscale netmap (usually somewhere
-     * in DERPMap). Copy only the JSON body to a right-sized buffer, then release
-     * the H2 window before parsing. */
-    char *json_buf = malloc(parse_len + 1);
-    if (!json_buf) {
-        ESP_LOGE(TAG,
-                 "Unable to allocate %d-byte compact MapResponse buffer (largest=%dKB free=%dKB)",
-                 (int)(parse_len + 1),
-                 (int)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
-                 (int)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
-        free(h2_recv);
-        return -1;
+    /* cJSON allocates a tree while parsing. On classic ESP32 without PSRAM we
+     * must not allocate a second ~20KB JSON buffer while the H2 receive window
+     * is still alive: after DERP/WireGuard have been running for a while the
+     * heap can have plenty of free bytes overall but no second contiguous block
+     * large enough for the copy.
+     *
+     * DATA payloads were already compacted into h2_recv. Move the selected JSON
+     * body (normally past the 4-byte streaming length prefix) to offset zero,
+     * NUL-terminate it, then shrink the existing allocation in place. Shrinking
+     * releases the unused tail without requiring another parse_len-sized block. */
+    if (parse_start != (char *)h2_recv) {
+        memmove(h2_recv, parse_start, parse_len);
     }
-    memcpy(json_buf, parse_start, parse_len);
-    json_buf[parse_len] = '\0';
-    free(h2_recv);
-    h2_recv = NULL;
+    h2_recv[parse_len] = '\0';
+
+    uint8_t *shrunk = heap_caps_realloc(h2_recv, parse_len + 1, MALLOC_CAP_8BIT);
+    if (shrunk) {
+        h2_recv = shrunk;
+    } else {
+        /* A shrink should normally succeed in place. If the allocator refuses
+         * it, the original pointer remains valid; parsing from it is still safer
+         * than failing the control-plane connection immediately. */
+        ESP_LOGW(TAG,
+                 "Could not shrink MapResponse buffer from %lu to %lu bytes; parsing in-place",
+                 (unsigned long)h2_window, (unsigned long)(parse_len + 1));
+    }
+
+    char *json_buf = (char *)h2_recv;
 
     ESP_LOGI(TAG,
-             "Released H2 window before JSON parse (json=%dKB largest_free=%dKB total_free=%dKB)",
+             "MapResponse compacted in-place (json=%dKB largest_free=%dKB total_free=%dKB)",
              (int)(parse_len / 1024),
              (int)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
              (int)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
