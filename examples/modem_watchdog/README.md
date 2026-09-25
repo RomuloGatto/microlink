@@ -26,12 +26,12 @@ For the Novoagatto Headscale deployment, also open **Control Plane** and use:
 - hostname: `headscale.novoagatto.com`
 - TLS/443: enabled
 - Noise public key: the 64 hex characters from
-  `https://headscale.novoagatto.com/key?v=88`
+  `https://headscale.novoagatto.com/key?v=131`
 
 On macOS the value can be extracted with:
 
 ```bash
-curl -fsSL 'https://headscale.novoagatto.com/key?v=88' \
+curl -fsSL 'https://headscale.novoagatto.com/key?v=131' \
   | python3 -c 'import json,sys; j=json.load(sys.stdin); print((j.get("publicKey") or j.get("legacyPublicKey") or "").removeprefix("mkey:"))'
 ```
 
