@@ -1871,19 +1871,41 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
         }
     }
 
-    /* Null-terminate */
-    char saved = parse_start[parse_len];
-    parse_start[parse_len] = '\0';
+    /* cJSON allocates a tree while parsing. On classic ESP32 without PSRAM
+     * keeping the 64KB H2 receive window alive here leaves too little heap and
+     * cJSON fails part-way through the ~20KB Headscale netmap (usually somewhere
+     * in DERPMap). Copy only the JSON body to a right-sized buffer, then release
+     * the H2 window before parsing. */
+    char *json_buf = malloc(parse_len + 1);
+    if (!json_buf) {
+        ESP_LOGE(TAG,
+                 "Unable to allocate %d-byte compact MapResponse buffer (largest=%dKB free=%dKB)",
+                 (int)(parse_len + 1),
+                 (int)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+                 (int)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+        free(h2_recv);
+        return -1;
+    }
+    memcpy(json_buf, parse_start, parse_len);
+    json_buf[parse_len] = '\0';
+    free(h2_recv);
+    h2_recv = NULL;
 
-    cJSON *map_json = cJSON_Parse(parse_start);
-    parse_start[parse_len] = saved;
+    ESP_LOGI(TAG,
+             "Released H2 window before JSON parse (json=%dKB largest_free=%dKB total_free=%dKB)",
+             (int)(parse_len / 1024),
+             (int)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+             (int)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+
+    cJSON *map_json = cJSON_Parse(json_buf);
 
     if (!map_json) {
         const char *err = cJSON_GetErrorPtr();
         ESP_LOGE(TAG, "MapResponse JSON parse failed near: %.50s", err ? err : "unknown");
-        free(h2_recv);
+        free(json_buf);
         return -1;
     }
+    free(json_buf);
 
     /* Debug: log all top-level fields in MapResponse (from v1 lines 3053-3072) */
     {
@@ -2079,7 +2101,6 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise, bool streami
     }
 
     cJSON_Delete(map_json);
-    free(h2_recv);
 
     int64_t t_map_done = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %lld ms (total map: %lld ms, %dKB)",
