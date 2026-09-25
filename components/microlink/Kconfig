@@ -94,6 +94,40 @@ menu "MicroLink V2 Configuration"
             - 1024: ~600 peers (large enterprise tailnets)
             - 2048: ~1200 peers (very large tailnets, requires 8MB PSRAM)
 
+    menu "Subnet Router"
+
+        config ML_ENABLE_SUBNET_ROUTER
+            bool "Enable IPv4 Tailscale subnet router"
+            default n
+            select LWIP_IP_FORWARD
+            select LWIP_IPV4_NAPT
+            help
+                Enable IPv4 forwarding and NAPT so this ESP32 can advertise a
+                LAN prefix to Tailscale and route tailnet traffic into the
+                local network. NAPT is enabled on the WireGuard interface, so
+                LAN devices see the ESP32's WiFi address as the source and do
+                not need a route back to the Tailscale 100.64.0.0/10 range.
+
+                The route still needs approval in the Tailscale admin console
+                unless your tailnet policy auto-approves it.
+
+                This feature implements subnet routing only. It deliberately
+                does not support advertising 0.0.0.0/0 as an internet exit
+                node.
+
+        config ML_SUBNET_ROUTE
+            string "IPv4 subnet to advertise"
+            depends on ML_ENABLE_SUBNET_ROUTER
+            default ""
+            help
+                One IPv4 CIDR prefix to advertise, for example
+                "192.168.100.0/24". Applications may instead set
+                microlink_config_t.advertise_route at runtime before
+                microlink_init(); that value takes precedence over this
+                Kconfig default.
+
+    endmenu
+
     menu "Cellular Modem"
 
         config ML_ENABLE_CELLULAR

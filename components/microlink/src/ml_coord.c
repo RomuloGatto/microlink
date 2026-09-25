@@ -770,6 +770,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+    add_routable_ips_to_hostinfo(ml, hostinfo);
 
     /* NetInfo inside Hostinfo — control plane reads PreferredDERP from here
      * to populate Node.HomeDERP for other peers */
@@ -1358,6 +1359,21 @@ check_removed:
     }
 }
 
+/* Advertise the configured LAN prefix using the same Hostinfo.RoutableIPs
+ * field as native tailscaled's AdvertiseRoutes preference. The control plane
+ * still owns route approval/policy; this only announces capability. */
+static void add_routable_ips_to_hostinfo(microlink_t *ml, cJSON *hostinfo) {
+    if (!ml || !hostinfo || !ml->subnet_router_enabled || !ml->subnet_route_cidr[0]) {
+        return;
+    }
+
+    cJSON *routes = cJSON_AddArrayToObject(hostinfo, "RoutableIPs");
+    if (!routes) {
+        return;
+    }
+    cJSON_AddItemToArray(routes, cJSON_CreateString(ml->subnet_route_cidr));
+}
+
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
  * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
@@ -1464,6 +1480,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+    add_routable_ips_to_hostinfo(ml, hostinfo);
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
     /* NetInfo: tell control plane our preferred DERP region and NAT type.
@@ -1959,6 +1976,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+        add_routable_ips_to_hostinfo(ml, hostinfo);
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
 
@@ -2064,6 +2082,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+        add_routable_ips_to_hostinfo(ml, hostinfo);
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
         cJSON *netinfo = cJSON_CreateObject();

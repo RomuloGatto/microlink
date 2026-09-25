@@ -483,6 +483,16 @@ struct microlink_s {
      * Owned exclusively by wg_mgr task; set only via ML_PEER_SET_EXIT_NODE. */
     volatile uint32_t exit_node_ip;
 
+    /* Optional Tailscale subnet-router state. The advertised prefix is parsed
+     * once during microlink_init() and then treated as read-only by workers.
+     * NAPT is enabled on the WireGuard netif: packets entering from the
+     * tailnet are source-NATed to the ESP's LAN address before leaving WiFi,
+     * so ordinary LAN devices can reply without a route back to 100.64/10. */
+    bool subnet_router_enabled;
+    uint32_t subnet_route_ip;            /* canonical network, host byte order */
+    uint8_t subnet_route_prefix_len;
+    char subnet_route_cidr[20];          /* "255.255.255.255/32" + NUL */
+
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;

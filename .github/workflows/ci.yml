@@ -90,6 +90,8 @@ jobs:
             base_example: basic_connect
           - variant: minimal
             base_example: basic_connect
+          - variant: subnet-router
+            base_example: basic_connect
           - variant: cellular-zerocopy
             base_example: cellular_connect
     steps:

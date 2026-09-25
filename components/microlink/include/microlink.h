@@ -33,6 +33,18 @@ typedef struct {
     uint8_t max_peers;          /* Max simultaneous peers (default: 16) */
     int8_t wifi_tx_power_dbm;   /* WiFi TX power in dBm (0 = default 19.5) */
 
+    /* Optional IPv4 subnet route to advertise through this ESP32, for example
+     * "192.168.100.0/24". Requires CONFIG_ML_ENABLE_SUBNET_ROUTER=y so lwIP
+     * IP forwarding + NAPT are compiled in. The route is advertised through
+     * Hostinfo.RoutableIPs and still needs normal Tailscale route approval
+     * (or an autoApprover policy) before other peers will use it.
+     *
+     * NULL/empty = use CONFIG_ML_SUBNET_ROUTE when the feature is compiled,
+     * otherwise disable subnet routing. One IPv4 prefix is supported for now.
+     * 0.0.0.0/0 is intentionally rejected; this is a subnet router, not an
+     * internet exit node. */
+    const char *advertise_route;
+
     /* Priority peer: guaranteed a WG slot even when peer table is full.
      * On large tailnets the NVS cache can fill the peer table at boot
      * before the priority peer arrives from MapResponse. When the table
