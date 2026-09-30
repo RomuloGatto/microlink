@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
@@ -46,6 +47,81 @@
 #include "dashboard_html.h"
 
 static const char *TAG = "modem_watchdog";
+
+#define LOG_RING_SIZE        8192U
+#define LOG_CAPTURE_LINE_MAX 512U
+
+static char log_ring[LOG_RING_SIZE];
+static size_t log_ring_head = 0;
+static size_t log_ring_len = 0;
+static portMUX_TYPE log_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t previous_log_vprintf = NULL;
+
+static void log_ring_append(const char *data, size_t len) {
+    if (!data || len == 0) return;
+    if (len > LOG_RING_SIZE) {
+        data += len - LOG_RING_SIZE;
+        len = LOG_RING_SIZE;
+    }
+
+    portENTER_CRITICAL(&log_ring_mux);
+    size_t first = LOG_RING_SIZE - log_ring_head;
+    if (first > len) first = len;
+    memcpy(log_ring + log_ring_head, data, first);
+    log_ring_head = (log_ring_head + first) % LOG_RING_SIZE;
+
+    size_t remaining = len - first;
+    if (remaining) {
+        memcpy(log_ring + log_ring_head, data + first, remaining);
+        log_ring_head = (log_ring_head + remaining) % LOG_RING_SIZE;
+    }
+
+    size_t new_len = log_ring_len + len;
+    log_ring_len = new_len > LOG_RING_SIZE ? LOG_RING_SIZE : new_len;
+    portEXIT_CRITICAL(&log_ring_mux);
+}
+
+static size_t log_ring_snapshot(char *dst, size_t dst_size) {
+    if (!dst || dst_size == 0) return 0;
+
+    portENTER_CRITICAL(&log_ring_mux);
+    size_t len = log_ring_len;
+    if (len >= dst_size) len = dst_size - 1;
+
+    size_t start = (log_ring_head + LOG_RING_SIZE - len) % LOG_RING_SIZE;
+    size_t first = LOG_RING_SIZE - start;
+    if (first > len) first = len;
+    memcpy(dst, log_ring + start, first);
+    if (len > first) memcpy(dst + first, log_ring, len - first);
+    portEXIT_CRITICAL(&log_ring_mux);
+
+    dst[len] = '\0';
+    return len;
+}
+
+static int capture_log_vprintf(const char *fmt, va_list args) {
+    va_list output_args;
+    va_list capture_args;
+    va_copy(output_args, args);
+    va_copy(capture_args, args);
+
+    int result = previous_log_vprintf
+        ? previous_log_vprintf(fmt, output_args)
+        : vprintf(fmt, output_args);
+
+    char line[LOG_CAPTURE_LINE_MAX];
+    int n = vsnprintf(line, sizeof(line), fmt, capture_args);
+
+    va_end(output_args);
+    va_end(capture_args);
+
+    if (n > 0) {
+        size_t len = (size_t)n;
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        log_ring_append(line, len);
+    }
+    return result;
+}
 
 /* ============================================================================
  * Hardware / watchdog policy
@@ -932,6 +1008,23 @@ static esp_err_t health_handler(httpd_req_t *req) {
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t logs_api_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+
+    char *snapshot = malloc(LOG_RING_SIZE + 1);
+    if (!snapshot) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Not enough memory to snapshot logs.\n");
+    }
+
+    size_t len = log_ring_snapshot(snapshot, LOG_RING_SIZE + 1);
+    esp_err_t ret = httpd_resp_send(req, snapshot, (ssize_t)len);
+    free(snapshot);
+    return ret;
+}
+
 static esp_err_t reboot_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Connection", "close");
     if (ota_in_progress) {
@@ -1156,6 +1249,11 @@ static void start_http_server(void) {
         .method = HTTP_POST,
         .handler = ota_handler,
     };
+    const httpd_uri_t logs_api = {
+        .uri = "/api/logs",
+        .method = HTTP_GET,
+        .handler = logs_api_handler,
+    };
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &health));
@@ -1167,6 +1265,7 @@ static void start_http_server(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &config_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &reboot_api));
     ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &ota_api));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &logs_api));
     ESP_ERROR_CHECK(httpd_register_err_handler(
         http_server, HTTPD_404_NOT_FOUND, captive_portal_404_handler));
 
@@ -1483,6 +1582,8 @@ static void microlink_task(void *arg) {
  * ========================================================================== */
 
 void app_main(void) {
+    previous_log_vprintf = esp_log_set_vprintf(capture_log_vprintf);
+
     /* Protect modem power before doing anything slow. */
     relay_init_safe();
 
