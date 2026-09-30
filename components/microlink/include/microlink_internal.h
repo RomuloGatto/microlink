@@ -45,7 +45,10 @@ extern "C" {
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
 
-#define ML_TASK_DERP_TX_STACK   (14 * 1024)
+/* DERP uses ~3.5KB on the WROOM test target (high-water mark leaves
+ * ~10.5KB free with the old 14KB stack). 8KB keeps >4KB safety margin while
+ * returning 6KB of precious contiguous internal RAM to control-plane/H2. */
+#define ML_TASK_DERP_TX_STACK   (8 * 1024)
 #define ML_TASK_DERP_TX_PRIO    5
 #define ML_TASK_DERP_TX_CORE    0
 
@@ -97,8 +100,12 @@ extern "C" {
  * connected but nothing has arrived in this long, force a reconnect. */
 #define ML_DERP_STALE_MS        90000
 
-/* Tailscale control plane */
+/* Tailscale / Headscale control plane */
+#ifdef CONFIG_ML_CTRL_HOST
+#define ML_CTRL_HOST            CONFIG_ML_CTRL_HOST
+#else
 #define ML_CTRL_HOST            "controlplane.tailscale.com"
+#endif
 #define ML_CTRL_PORT            443
 #define ML_CTRL_PROTOCOL_VER    131
 
@@ -409,6 +416,17 @@ typedef struct {
 } ml_derp_conn_t;
 
 /* ============================================================================
+ * Control Plane TLS State (CONFIG_ML_CTRL_TLS)
+ * ========================================================================== */
+
+typedef struct {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config ssl_conf;
+    int sockfd;
+    bool active;
+} ml_coord_tls_t;
+
+/* ============================================================================
  * Main Context
  * ========================================================================== */
 
@@ -462,6 +480,9 @@ struct microlink_s {
 
     /* Coordination socket (owned exclusively by coord task) */
     int coord_sock;
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_t coord_tls;
+#endif
     uint32_t h2_next_stream_id;         /* Next H2 stream ID for endpoint updates (odd, starts at 7) */
     /* Runtime H2 recv/JSON-parse window, chosen per connect cycle by
      * choose_h2_rx_window_size() from free heap; never exceeds ML_H2_BUFFER_SIZE. */
@@ -482,6 +503,16 @@ struct microlink_s {
     /* VPN IP of the peer configured as tailnet-range fallback route (0 = none).
      * Owned exclusively by wg_mgr task; set only via ML_PEER_SET_EXIT_NODE. */
     volatile uint32_t exit_node_ip;
+
+    /* Optional Tailscale subnet-router state. The advertised prefix is parsed
+     * once during microlink_init() and then treated as read-only by workers.
+     * NAPT is enabled on the WireGuard netif: packets entering from the
+     * tailnet are source-NATed to the ESP's LAN address before leaving WiFi,
+     * so ordinary LAN devices can reply without a route back to 100.64/10. */
+    bool subnet_router_enabled;
+    uint32_t subnet_route_ip;            /* canonical network, host byte order */
+    uint8_t subnet_route_prefix_len;
+    char subnet_route_cidr[20];          /* "255.255.255.255/32" + NUL */
 
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
@@ -541,8 +572,12 @@ struct microlink_s {
     char nvs_device_name[48];
 
     /* Control plane host override (empty = use ML_CTRL_HOST default).
-     * Set from NVS at boot for Headscale/Ionscale/custom coordinators. */
+     * Set from config or NVS at boot for Headscale/Ionscale/custom coordinators. */
     char ctrl_host[64];
+
+    /* Optional custom control-plane Noise public key. */
+    uint8_t ctrl_noise_pubkey[32];
+    bool ctrl_noise_pubkey_set;
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */
@@ -608,6 +643,15 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
                              uint32_t *out_ip, uint16_t *out_port);
 bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
                                   uint8_t *out_ip6, uint16_t *out_port);
+
+/* ml_coord_tls.c */
+#ifdef CONFIG_ML_CTRL_TLS
+int ml_coord_tls_handshake(microlink_t *ml, const char *hostname);
+int ml_coord_tls_send(microlink_t *ml, const uint8_t *data, size_t len);
+int ml_coord_tls_recv(microlink_t *ml, uint8_t *buf, size_t len);
+size_t ml_coord_tls_pending(microlink_t *ml);
+void ml_coord_tls_free(microlink_t *ml);
+#endif
 
 /* ml_noise.c */
 void ml_noise_init(ml_noise_state_t *state,

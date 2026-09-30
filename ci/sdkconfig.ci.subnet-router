@@ -1,0 +1,3 @@
+# Compile-time coverage for the IPv4 subnet-router path.
+CONFIG_ML_ENABLE_SUBNET_ROUTER=y
+CONFIG_ML_SUBNET_ROUTE="192.168.50.0/24"

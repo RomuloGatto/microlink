@@ -33,6 +33,18 @@ typedef struct {
     uint8_t max_peers;          /* Max simultaneous peers (default: 16) */
     int8_t wifi_tx_power_dbm;   /* WiFi TX power in dBm (0 = default 19.5) */
 
+    /* Optional IPv4 subnet route to advertise through this ESP32, for example
+     * "192.168.100.0/24". Requires CONFIG_ML_ENABLE_SUBNET_ROUTER=y so lwIP
+     * IP forwarding + NAPT are compiled in. The route is advertised through
+     * Hostinfo.RoutableIPs and still needs normal Tailscale route approval
+     * (or an autoApprover policy) before other peers will use it.
+     *
+     * NULL/empty = use CONFIG_ML_SUBNET_ROUTE when the feature is compiled,
+     * otherwise disable subnet routing. One IPv4 prefix is supported for now.
+     * 0.0.0.0/0 is intentionally rejected; this is a subnet router, not an
+     * internet exit node. */
+    const char *advertise_route;
+
     /* Priority peer: guaranteed a WG slot even when peer table is full.
      * On large tailnets the NVS cache can fill the peer table at boot
      * before the priority peer arrives from MapResponse. When the table
@@ -45,6 +57,26 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Optional custom coordination server (Headscale / Ionscale).
+     * NULL/empty host uses CONFIG_ML_CTRL_HOST. A non-NULL Noise key points
+     * to 32 raw bytes and overrides CONFIG_ML_CTRL_NOISE_PUBKEY_HEX. */
+    const char *ctrl_host;
+    const uint8_t *ctrl_noise_pubkey;
+
+    /* Optional runtime TLS selection for custom control planes.
+     * Existing callers keep the compiled CONFIG_ML_CTRL_TLS behavior because
+     * ctrl_tls_override defaults to false. When true, ctrl_tls selects
+     * HTTPS/TLS (port 443) vs plain HTTP/TCP (port 80). TLS can only be
+     * enabled at runtime when CONFIG_ML_CTRL_TLS is compiled in. */
+    bool ctrl_tls_override;
+    bool ctrl_tls;
+
+    /* When false (default), an empty advertise_route falls back to the
+     * CONFIG_ML_SUBNET_ROUTE Kconfig value for backwards compatibility.
+     * Set true to make advertise_route authoritative at runtime; an empty
+     * string then explicitly disables subnet routing for this instance. */
+    bool advertise_route_override;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */

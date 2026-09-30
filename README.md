@@ -654,6 +654,50 @@ MicroLink supports custom coordination servers like [Headscale](https://github.c
 - MicroLink implements ts2021 — ensure your coordination server supports this version
 - DERP discovery is automatic from the server's `DERPMap`
 
+## IPv4 Subnet Router (Experimental)
+
+MicroLink can advertise one IPv4 LAN prefix and forward approved Tailscale
+traffic into that network. This is intended for small embedded gateways such
+as reaching cameras, printers, or other LAN-only devices without leaving a
+Linux Tailscale router running.
+
+Enable the feature in `sdkconfig.defaults`:
+
+```ini
+CONFIG_ML_ENABLE_SUBNET_ROUTER=y
+CONFIG_ML_SUBNET_ROUTE="192.168.100.0/24"
+```
+
+`ML_ENABLE_SUBNET_ROUTER` selects ESP-IDF's lwIP IP forwarding and IPv4 NAPT
+support. Packets enter on the WireGuard netif, are forwarded to the matching
+LAN route on WiFi STA, and are source-NATed to the ESP32's LAN address so the
+destination device does not need a route back to `100.64.0.0/10`.
+
+Applications can override the Kconfig route before initialization:
+
+```c
+microlink_config_t config = {
+    .auth_key = "tskey-auth-...",
+    .device_name = "lan-gateway",
+    .enable_derp = true,
+    .enable_disco = true,
+    .enable_stun = true,
+    .advertise_route = "192.168.100.0/24",
+};
+
+microlink_t *ml = microlink_init(&config);
+```
+
+The route is announced as `Hostinfo.RoutableIPs`, matching native Tailscale
+subnet-route advertisement. It must still be approved in the Tailscale admin
+console (or by an `autoApprovers` policy) before other peers will route
+traffic through the ESP32.
+
+Current scope is deliberately narrow: one IPv4 prefix, WiFi/PPP forwarding
+through lwIP, and no `0.0.0.0/0` exit-node mode. Subnet-router throughput and
+long-running video-stream stability should be verified on the target board
+before production deployment.
+
 ## High-Throughput Mode (Zero-Copy WireGuard)
 
 For applications requiring high data throughput (e.g., video streaming at 30fps+), MicroLink offers an optional zero-copy WireGuard receive mode.

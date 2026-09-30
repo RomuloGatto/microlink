@@ -24,6 +24,9 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+#include "lwip/lwip_napt.h"
+#endif
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
@@ -375,6 +378,41 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     netif_set_up(netif);
     netif_set_link_up(netif);
     netif->state = wg_state;
+
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+    if (ml->subnet_router_enabled) {
+#if IP_NAPT
+        /* WireGuard is the "inside" interface for NAPT: tailnet packets enter
+         * here and are forwarded to the LAN via WiFi STA. Rewriting their
+         * source to the ESP's LAN address means ordinary LAN devices can
+         * reply without any route back to 100.64.0.0/10. */
+        /* esp-lwip's low-level ip_napt_enable_netif() is boolean-like:
+         * 1 = success, 0 = failure. It does NOT return lwIP err_t/ERR_OK.
+         * Treating 1 as an error caused us to tear down a successfully
+         * initialized WireGuard netif on classic ESP32. */
+        int napt_ok = ip_napt_enable_netif(netif, 1);
+        if (napt_ok == 0) {
+            ESP_LOGE(TAG, "Failed to enable NAPT on WireGuard netif");
+            wireguardif_shutdown(netif);
+            netif_set_link_down(netif);
+            netif_set_down(netif);
+            netif_remove(netif);
+            free(netif);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Subnet router forwarding/NAPT enabled for %s",
+                 ml->subnet_route_cidr);
+#else
+        ESP_LOGE(TAG, "Subnet router enabled but lwIP was built without IP_NAPT");
+        wireguardif_shutdown(netif);
+        netif_set_link_down(netif);
+        netif_set_down(netif);
+        netif_remove(netif);
+        free(netif);
+        return ESP_FAIL;
+#endif
+    }
+#endif
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
      * thread).  Bind to port 51820 to match the DISCO socket source port.
@@ -1975,6 +2013,14 @@ void ml_wg_mgr_task(void *arg) {
     /* Shutdown WireGuard interface */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
+#ifdef CONFIG_ML_ENABLE_SUBNET_ROUTER
+#if IP_NAPT
+        if (ml->subnet_router_enabled) {
+            ip_napt_enable_netif(netif, 0);
+            ESP_LOGI(TAG, "Subnet router NAPT disabled");
+        }
+#endif
+#endif
         wireguardif_shutdown(netif);
         netif_set_link_down(netif);
         netif_set_down(netif);
