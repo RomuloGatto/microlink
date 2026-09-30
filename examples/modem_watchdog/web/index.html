@@ -24,6 +24,7 @@
 <div class='brand'><div class='brandmark'><svg><use href='#wifi'/></svg></div><div><h1>Modem Watchdog</h1><p>Automatic modem monitoring and recovery</p></div></div>
 <div class='hero-actions'>
 <a class='health-link' href='/health' target='_blank'>Health JSON</a>
+<button id='logs' class='btn btn-secondary' type='button'>Live logs</button>
 <button id='ota' class='btn btn-secondary' type='button'>Update firmware</button>
 <input id='ota_file' type='file' accept='.bin,application/octet-stream' hidden>
 <button id='save' class='btn btn-primary' type='submit' form='form'>Save settings</button>
@@ -86,6 +87,12 @@
 <div id='countdown' class='countdown'><div class='count-num'><span id='count_value'>20</span><span id='count_suffix'>s</span></div><div id='count_label' class='count-label'>restoring power in...</div><div class='progress'><div id='progress'></div></div></div>
 <div id='modal_actions' class='modal-actions'><button id='cancel' class='modal-btn' type='button'>Cancel</button><button id='confirm' class='modal-btn danger' type='button'>Restart</button></div>
 </div></div>
+<div id='log_overlay' class='log-overlay'>
+<div class='log-modal'>
+<div class='log-head'><div><h3>Live logs</h3><p>Live tail from the ESP. The last 8 KB are kept in memory.</p></div><div class='log-actions'><button id='log_pause' class='modal-btn' type='button'>Pause</button><button id='log_close' class='modal-btn' type='button'>Close</button></div></div>
+<pre id='log_output' class='log-output'>Loading logs...</pre>
+</div>
+</div>
 <script src='/app.js'></script>
 </body>
 </html>
