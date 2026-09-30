@@ -384,7 +384,11 @@ static void refresh_reboot_window(uint64_t now) {
 }
 
 static bool start_modem_reboot(bool manual) {
-    if (wd_state != WD_NORMAL) {
+    /* A manual restart is also valid while the modem is in its boot grace
+     * period. In that case, immediately cut power again and restart the whole
+     * power-cycle state machine from WD_POWER_CUT. Automatic restarts remain
+     * restricted to the normal monitoring state. */
+    if (wd_state == WD_POWER_CUT || (!manual && wd_state != WD_NORMAL)) {
         return false;
     }
 
@@ -934,9 +938,12 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_sendstr(req, "Firmware update in progress.\n");
     }
-    if (wd_state != WD_NORMAL) {
+    /* While power is already cut, another request cannot do anything useful.
+     * During the modem boot grace period, however, a manual restart should
+     * really start a new physical power cycle instead of being rejected. */
+    if (wd_state == WD_POWER_CUT) {
         httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_sendstr(req, "Modem reboot already in progress.\n");
+        return httpd_resp_sendstr(req, "Modem power cycle is already in progress.\n");
     }
 
     manual_reboot_requested = true;
