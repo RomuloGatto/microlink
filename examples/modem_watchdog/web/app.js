@@ -72,7 +72,27 @@ async function doReboot(){
  }
  catch(e){busy=false;$('countdown').classList.remove('show');$('modal_actions').style.display='flex';$('modal_desc').textContent=e.message||'The restart command was rejected.';toast('Failed to restart modem','error')}
 }
+let logTimer=null,logsPaused=false;
+async function refreshLogs(){
+ if(logsPaused)return;
+ try{
+  const out=$('log_output'),stick=!out.dataset.loaded||(out.scrollHeight-out.scrollTop-out.clientHeight<80);
+  const r=await fetch('/api/logs',{cache:'no-store'});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const body=await r.text();
+  out.textContent=body||'(no logs captured yet)';
+  out.dataset.loaded='1';
+  if(stick)out.scrollTop=out.scrollHeight
+ }catch(e){$('log_output').textContent='Unable to load logs: '+(e.message||e)}
+}
+function openLogs(){
+ $('log_overlay').classList.add('show');logsPaused=false;$('log_pause').textContent='Pause';$('log_output').dataset.loaded='';
+ clearInterval(logTimer);refreshLogs();logTimer=setInterval(refreshLogs,1000)
+}
+function closeLogs(){clearInterval(logTimer);logTimer=null;$('log_overlay').classList.remove('show')}
+function toggleLogs(){logsPaused=!logsPaused;$('log_pause').textContent=logsPaused?'Resume':'Pause';if(!logsPaused)refreshLogs()}
+$('logs').onclick=openLogs;$('log_close').onclick=closeLogs;$('log_pause').onclick=toggleLogs;$('log_overlay').onclick=e=>{if(e.target===$('log_overlay'))closeLogs()};
 document.querySelectorAll('[data-eye]').forEach(b=>b.onclick=()=>{const i=$(b.getAttribute('data-eye'));i.type=i.type==='password'?'text':'password'});
-$('form').addEventListener('submit',save);$('form').addEventListener('input',syncDirty);$('form').addEventListener('change',syncDirty);$('reboot').onclick=showConfirm;$('ota').onclick=showOtaPicker;$('ota_file').addEventListener('change',e=>showOtaConfirm(e.target.files&&e.target.files[0]));$('cancel').onclick=modalClose;$('confirm').onclick=doReboot;$('overlay').onclick=e=>{if(e.target===$('overlay'))modalClose()};document.addEventListener('keydown',e=>{if(e.key==='Escape')modalClose()});
+$('form').addEventListener('submit',save);$('form').addEventListener('input',syncDirty);$('form').addEventListener('change',syncDirty);$('reboot').onclick=showConfirm;$('ota').onclick=showOtaPicker;$('ota_file').addEventListener('change',e=>showOtaConfirm(e.target.files&&e.target.files[0]));$('cancel').onclick=modalClose;$('confirm').onclick=doReboot;$('overlay').onclick=e=>{if(e.target===$('overlay'))modalClose()};document.addEventListener('keydown',e=>{if(e.key==='Escape'){if($('log_overlay').classList.contains('show'))closeLogs();else modalClose()}});
 $('modem_off_s').addEventListener('input',()=>{$('off_note').textContent=$('modem_off_s').value||20});
 Promise.all([loadSettings(),loadHealth()]).catch(e=>toast('Failed to load dashboard','error'));healthTimer=setInterval(loadHealth,10000);stateTickTimer=setInterval(renderState,1000);
